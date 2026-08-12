@@ -18,6 +18,7 @@ package apns
 import (
 	"context"
 	"fmt"
+	"log"
 
 	"github.com/sideshow/apns2"
 	"github.com/sideshow/apns2/payload"
@@ -143,6 +144,13 @@ func (s *Sender) sendOne(ctx context.Context, m push.Message) push.Status {
 	switch resp.Reason {
 	case apns2.ReasonUnregistered, apns2.ReasonBadDeviceToken, apns2.ReasonExpiredToken:
 		return push.StatusUnregistered
+	case apns2.ReasonExpiredProviderToken, apns2.ReasonInvalidProviderToken,
+		apns2.ReasonMissingProviderToken, apns2.ReasonForbidden:
+		// Whole-pipeline credential death, not per-token noise: every send through this
+		// relay fails until the operator fixes the APNs key, so it must not log like a
+		// stale device token (which is to say, not at all).
+		log.Printf("relay: apns rejected the provider credential (reason=%s); every ios send will fail until the key is fixed", resp.Reason)
+		return push.StatusError
 	default:
 		return push.StatusError
 	}

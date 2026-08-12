@@ -25,6 +25,13 @@ Compromise of either credential is the most serious outcome for this project: it
 Registration keys are stored only as SHA-256 hashes, so a leak of the SQLite database alone does not expose a usable key.
 A compromised or misbehaving registered server can be cut off with `POST /admin/keys/{id}/revoke`.
 
+## Known residual: token binding is first-come
+
+Every device token is bound to whichever registration key first sends to it, and a send for a token bound to somebody else's key is refused.
+That stops one registered server from pushing to another server's devices, and it has a residual: a key that names a token first owns it, and there is no admin operation to unbind a token from a key.
+The binding does expire on its own - a token unused for the retention window (90 days by default, `RELAY_TOKEN_RETENTION_DAYS`) is pruned and can be claimed fresh - so a squatted token is denied its real server for at most that window, and only if the squatter guessed or obtained a token value that is itself unguessable in practice (APNs and FCM tokens are opaque, high-entropy, and never published by slim-m).
+Recorded here so the shape is a decision rather than a surprise; an admin unbind endpoint is the fix if this ever stops being theoretical.
+
 ## Baseline, not maximal, security
 
 This project targets Discord-level baseline security, not end-to-end or nation-state-resistant guarantees.

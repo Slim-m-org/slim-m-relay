@@ -31,6 +31,15 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, v any, maxBytes int64) e
 	return dec.Decode(v)
 }
 
+// decodeJSONAdditive is decodeJSON without the unknown-field rejection, for the one body
+// the home server owns both sides of: the two repos release independently under an
+// additive-only wire contract, so an operator running an older relay must not lose every
+// push the day the server adds a field. Registration keeps the strict decoder - its body
+// is operator-typed, where an unknown field is a typo worth refusing.
+func decodeJSONAdditive(w http.ResponseWriter, r *http.Request, v any, maxBytes int64) error {
+	return json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBytes)).Decode(v)
+}
+
 // bearerToken extracts the token from an "Authorization: Bearer <token>" header.
 func bearerToken(r *http.Request) string {
 	const prefix = "Bearer "

@@ -59,6 +59,10 @@ type dispatchItem struct {
 // has not been attempted by the deadline comes back as push.StatusNotAttempted so the caller
 // retries only those.
 func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
+	if !s.sendAdmitLim.Allow(s.clientIP(r)) {
+		writeErr(w, http.StatusTooManyRequests, "rate limit exceeded")
+		return
+	}
 	plain := bearerToken(r)
 	if plain == "" {
 		writeErr(w, http.StatusUnauthorized, "missing bearer key")
@@ -80,7 +84,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req sendReq
-	if err := decodeJSON(w, r, &req, 1<<20); err != nil {
+	if err := decodeJSONAdditive(w, r, &req, 1<<20); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid body")
 		return
 	}

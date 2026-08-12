@@ -186,14 +186,31 @@ func (s *Store) Verify(ctx context.Context, plain string) (*Key, error) {
 	if k.RevokedAt != nil {
 		return nil, ErrNotFound
 	}
-	// Stamp last-used and reflect it in the returned key, so the caller sees the value it
-	// just wrote rather than the pre-update state scanned above.
+	// The stamp doubles as the revocation gate: guarding on revoked_at closes the window
+	// where a revoke lands between the scan above and this write, so a just-revoked key
+	// cannot slip one more send through, and a write failure refuses rather than trusting
+	// the possibly stale scan.
 	used := time.Now()
-	if _, err := s.db.ExecContext(ctx, `UPDATE keys SET last_used_at = ? WHERE id = ?`, used.Unix(), k.ID); err == nil {
-		t := time.Unix(used.Unix(), 0)
-		k.LastUsedAt = &t
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE keys SET last_used_at = ? WHERE id = ? AND revoked_at IS NULL`,
+		used.Unix(), k.ID)
+	if err != nil {
+		return nil, err
 	}
+	if n, err := res.RowsAffected(); err != nil || n == 0 {
+		return nil, ErrNotFound
+	}
+	t := time.Unix(used.Unix(), 0)
+	k.LastUsedAt = &t
 	return k, nil
+}
+
+// Ping answers whether the store can actually serve a query right now, for the health
+// endpoint: a relay whose database has become unreadable or unwritable used to stay
+// green on /healthz while every register and verify failed.
+func (s *Store) Ping(ctx context.Context) error {
+	var one int
+	return s.db.QueryRowContext(ctx, `SELECT 1`).Scan(&one)
 }
 
 // List returns every issued key, newest first, for the admin view.
