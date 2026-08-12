@@ -52,6 +52,13 @@ type Config struct {
 	// and forever (revoked keys still count), so /v1/register cannot be used to grow the key
 	// table without bound. Zero or negative disables the ceiling.
 	MaxRegistrations int
+	// SendAdmitPerMinute and SendAdmitBurst bound how often one IP may reach /v1/send at
+	// all, checked before the bearer key is looked up: the key store is a single-connection
+	// SQLite handle, so unauthenticated garbage tokens would otherwise serialize every
+	// legitimate Verify behind their own lookups. Sized well above any honest server's
+	// send rate so only a flood ever meets it.
+	SendAdmitPerMinute int
+	SendAdmitBurst     int
 	// SendPerMinute and SendBurst bound how often one key may fan out notifications.
 	SendPerMinute int
 	SendBurst     int
@@ -100,6 +107,8 @@ func Load() Config {
 		RegisterPerHour:    getint("RELAY_REGISTER_PER_HOUR", 5),
 		RegisterBurst:      getint("RELAY_REGISTER_BURST", 3),
 		MaxRegistrations:   getint("RELAY_MAX_REGISTRATIONS", 10000),
+		SendAdmitPerMinute: getint("RELAY_SEND_ADMIT_PER_MINUTE", 600),
+		SendAdmitBurst:     getint("RELAY_SEND_ADMIT_BURST", 120),
 		SendPerMinute:      getint("RELAY_SEND_PER_MINUTE", 120),
 		SendBurst:          getint("RELAY_SEND_BURST", 60),
 		CallSendPerMinute:  getint("RELAY_CALL_SEND_PER_MINUTE", 10),

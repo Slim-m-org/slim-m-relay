@@ -59,6 +59,8 @@ func defaultCfg() config.Config {
 		MaxMessages:        500,
 		RegisterPerHour:    1000,
 		RegisterBurst:      1000,
+		SendAdmitPerMinute: 100000,
+		SendAdmitBurst:     100000,
 		SendPerMinute:      100000,
 		SendBurst:          100000,
 		SendConcurrency:    8,

@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"time"
 
@@ -148,6 +149,12 @@ func (s *Sender) sendOne(ctx context.Context, url, access string, m push.Message
 	defer resp.Body.Close()
 	if resp.StatusCode < 300 {
 		return push.StatusDelivered
+	}
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		// Whole-pipeline credential death, not per-token noise: the service account is
+		// rejected outright, so every android send fails until the operator fixes it.
+		log.Printf("relay: fcm rejected the service-account credential (http %d); every android send will fail until it is fixed", resp.StatusCode)
+		return push.StatusError
 	}
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
 	if resp.StatusCode == http.StatusBadRequest && tokenFieldViolation(raw) {

@@ -110,6 +110,8 @@ The `/data` volume holds the SQLite key store; back it up, since losing it means
 | `RELAY_REGISTER_PER_HOUR` | `5` | Per-IP registration rate. |
 | `RELAY_REGISTER_BURST` | `3` | Per-IP registration burst. |
 | `RELAY_MAX_REGISTRATIONS` | `10000` | Total keys the relay will ever mint, across every IP, forever (revoked keys still count against it). Zero or negative disables the ceiling. |
+| `RELAY_SEND_ADMIT_PER_MINUTE` | `600` | Per-IP admission rate on `/v1/send`, checked before the bearer key is looked up so unauthenticated garbage never reaches the key store. Sized well above any honest server's send rate. |
+| `RELAY_SEND_ADMIT_BURST` | `120` | Per-IP admission burst on `/v1/send`. |
 | `RELAY_SEND_PER_MINUTE` | `120` | Per-key send rate. |
 | `RELAY_SEND_BURST` | `60` | Per-key send burst. |
 | `RELAY_CALL_SEND_PER_MINUTE` | `10` | Per-key rate specifically for `call` kind pushes, tighter than `RELAY_SEND_PER_MINUTE` since a call rings a device and is the most abusable kind. |
