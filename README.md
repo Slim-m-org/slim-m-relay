@@ -129,3 +129,13 @@ go build ./cmd/relay
 ```
 
 Go 1.26, no CGO (the SQLite driver is pure Go), single static binary.
+
+## License
+
+[PolyForm Noncommercial 1.0.0](LICENSE).
+
+Free for noncommercial use: personal, hobby, educational, research, nonprofit, and all that.
+You can fork it, change it and redistribute it, you just can't sell it or use it commercially without asking first.
+If you want to use it commercially, open an issue and ask.
+
+Contributions are welcome. By submitting a pull request you agree that your changes are released under this same license.
