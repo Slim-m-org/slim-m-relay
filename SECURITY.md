@@ -2,7 +2,7 @@
 
 ## Reporting a vulnerability
 
-Report vulnerabilities privately through GitHub Security Advisories: https://github.com/nc1107/slim-m-relay/security/advisories/new
+Report vulnerabilities privately through GitHub Security Advisories: https://github.com/Slim-m-org/slim-m-relay/security/advisories/new
 Do not open a public issue for a security report.
 Include steps to reproduce, the affected version or commit, and the impact you believe it has.
 Expect an acknowledgement within a few days.
