@@ -8,6 +8,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sideshow/apns2"
 
@@ -185,5 +186,60 @@ func TestSendPayloadIsContentFree(t *testing.T) {
 	}
 	if strings.Contains(body, "opaque-ciphertext\"") && strings.Count(body, "opaque-ciphertext") != 1 {
 		t.Errorf("ciphertext appears more than once in the payload:\n%s", body)
+	}
+}
+
+// A security alert must surface on a locked device like a message does, with its own fixed text.
+func TestSendSecurityKindUsesAlertPush(t *testing.T) {
+	fc := &fakeClient{resp: &apns2.Response{StatusCode: 200}}
+	s := &Sender{client: fc, bundleID: "com.example.app"}
+	s.Send(context.Background(), []push.Message{{Token: "tok", Kind: push.KindSecurity, Payload: "cipher"}})
+
+	n := fc.got[0]
+	if n.Topic != "com.example.app" || n.PushType != apns2.PushTypeAlert || n.Priority != apns2.PriorityHigh {
+		t.Fatalf("security push = topic %q type %q priority %d, want a high-priority alert on the bundle id", n.Topic, n.PushType, n.Priority)
+	}
+	body, err := json.Marshal(n.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "New sign-in to your account") {
+		t.Errorf("security payload should carry its fixed alert text: %s", body)
+	}
+}
+
+// A call_end stops a ring, so it is a silent background push on the plain topic, never a VoIP one:
+// iOS kills an app that takes a VoIP push without reporting a new call.
+func TestSendCallEndKindIsSilentAndNotVoip(t *testing.T) {
+	fc := &fakeClient{resp: &apns2.Response{StatusCode: 200}}
+	s := &Sender{client: fc, bundleID: "com.example.app"}
+	s.Send(context.Background(), []push.Message{{Token: "tok", Kind: push.KindCallEnd, Payload: "cipher"}})
+
+	n := fc.got[0]
+	if n.Topic != "com.example.app" || n.PushType != apns2.PushTypeBackground || n.Priority != apns2.PriorityLow {
+		t.Fatalf("call_end push = topic %q type %q priority %d, want a low-priority background push on the bundle id", n.Topic, n.PushType, n.Priority)
+	}
+}
+
+// Only call signals expire with the ring; anything else keeps APNs' default store-and-forward.
+func TestSendExpiresOnlyCallSignals(t *testing.T) {
+	for _, kind := range []push.Kind{push.KindMessage, push.KindMention, push.KindCall, push.KindCallEnd, push.KindSecurity, push.KindWake} {
+		t.Run(string(kind), func(t *testing.T) {
+			fc := &fakeClient{resp: &apns2.Response{StatusCode: 200}}
+			s := &Sender{client: fc, bundleID: "com.example.app"}
+			before := time.Now()
+			s.Send(context.Background(), []push.Message{{Token: "tok", Kind: kind, Payload: "cipher"}})
+
+			exp := fc.got[0].Expiration
+			if !kind.IsCallSignal() {
+				if !exp.IsZero() {
+					t.Errorf("expiration = %v, want unset for a non-call kind", exp)
+				}
+				return
+			}
+			if exp.Before(before.Add(push.CallSignalTTL)) || exp.After(time.Now().Add(push.CallSignalTTL)) {
+				t.Errorf("expiration = %v, want now + %v", exp, push.CallSignalTTL)
+			}
+		})
 	}
 }

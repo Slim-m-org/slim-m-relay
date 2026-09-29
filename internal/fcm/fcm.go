@@ -133,7 +133,7 @@ func (s *Sender) sendOne(ctx context.Context, url, access string, m push.Message
 			},
 			// High priority wakes the app promptly even while backgrounded; the payload is
 			// opaque, so timely delivery is the only lever the relay has.
-			"android": map[string]any{"priority": "high"},
+			"android": androidConfig(m.Kind),
 		},
 	})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
@@ -223,4 +223,15 @@ func tokenFieldViolation(body []byte) bool {
 		}
 	}
 	return false
+}
+
+// androidConfig keeps every kind high priority so a dozing device still wakes for it, and
+// caps a call signal's lifetime so a device that comes back online late never rings for a
+// call that is already over.
+func androidConfig(kind push.Kind) map[string]any {
+	cfg := map[string]any{"priority": "high"}
+	if kind.IsCallSignal() {
+		cfg["ttl"] = fmt.Sprintf("%ds", int(push.CallSignalTTL/time.Second))
+	}
+	return cfg
 }

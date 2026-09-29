@@ -19,6 +19,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/sideshow/apns2"
 	"github.com/sideshow/apns2/payload"
@@ -44,8 +45,9 @@ const voipTopicSuffix = ".voip"
 // and message: it names nothing, so it is still content-free. A kind absent from this map
 // stays a silent background wake, which is what "wake" is for.
 var genericAlert = map[push.Kind]string{
-	push.KindMessage: "New message",
-	push.KindMention: "You were mentioned",
+	push.KindMessage:  "New message",
+	push.KindMention:  "You were mentioned",
+	push.KindSecurity: "New sign-in to your account",
 }
 
 // Sender holds the APNs token client and posts notifications to the gateway.
@@ -133,6 +135,10 @@ func (s *Sender) sendOne(ctx context.Context, m push.Message) push.Status {
 		n.Topic = s.bundleID + voipTopicSuffix
 		n.PushType = apns2.PushTypeVOIP
 		n.Priority = apns2.PriorityHigh
+	}
+	if m.Kind.IsCallSignal() {
+		// A ring held past its own timeout would ring for a call that is already over.
+		n.Expiration = time.Now().Add(push.CallSignalTTL)
 	}
 	resp, err := s.client.PushWithContext(ctx, n)
 	if err != nil {
