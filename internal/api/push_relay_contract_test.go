@@ -57,7 +57,7 @@ var contractCases = []contractCase{
 	{token: "contract-payload-at-limit", wantStatus: "delivered", wantPlatform: "android"},
 	// One byte over the ceiling must be rejected, never dispatched.
 	{token: "contract-payload-over-limit", wantStatus: "error"},
-	// A kind outside {message, mention, call, wake} must be rejected.
+	// A kind outside {message, mention, call, call_end, security, wake} must be rejected.
 	{token: "contract-unknown-kind", wantStatus: "error"},
 	// A platform outside {ios, android} must be rejected.
 	{token: "contract-unknown-platform", wantStatus: "error"},

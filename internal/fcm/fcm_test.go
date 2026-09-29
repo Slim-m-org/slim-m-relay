@@ -5,6 +5,7 @@ package fcm
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"log"
 	"net/http"
@@ -278,5 +279,38 @@ func TestSendNeverLogsContent(t *testing.T) {
 		if strings.Contains(buf.String(), secret) {
 			t.Errorf("log leaked %q:\n%s", secret, buf.String())
 		}
+	}
+}
+
+// A call signal carries a TTL matching the ring timeout, and nothing else does.
+func TestSendSetsTTLOnlyForCallSignals(t *testing.T) {
+	for _, kind := range []push.Kind{push.KindMessage, push.KindMention, push.KindCall, push.KindCallEnd, push.KindSecurity, push.KindWake} {
+		t.Run(string(kind), func(t *testing.T) {
+			var got struct {
+				Message struct {
+					Android map[string]any `json:"android"`
+				} `json:"message"`
+			}
+			fcm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				_ = json.Unmarshal(body, &got)
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{}`))
+			}))
+			defer fcm.Close()
+
+			testSender(fcm.URL).Send(context.Background(), []push.Message{{Token: "tok", Kind: kind, Payload: "p"}})
+
+			if got.Message.Android["priority"] != "high" {
+				t.Errorf("priority = %v, want high", got.Message.Android["priority"])
+			}
+			ttl, hasTTL := got.Message.Android["ttl"]
+			if kind.IsCallSignal() != hasTTL {
+				t.Fatalf("ttl present = %v, want %v", hasTTL, kind.IsCallSignal())
+			}
+			if hasTTL && ttl != "30s" {
+				t.Errorf("ttl = %v, want 30s", ttl)
+			}
+		})
 	}
 }

@@ -24,7 +24,7 @@ type sendReq struct {
 type sendMessage struct {
 	Platform string `json:"platform"` // "ios" or "android"
 	Token    string `json:"token"`
-	Kind     string `json:"kind"`    // "message", "mention", "call", or "wake"
+	Kind     string `json:"kind"`    // "message", "mention", "call", "call_end", "security" or "wake"
 	Payload  string `json:"payload"` // opaque, already-encrypted; the relay never inspects it
 }
 
@@ -261,7 +261,7 @@ func parsePlatform(s string) (push.Platform, bool) {
 
 func parseKind(s string) (push.Kind, bool) {
 	switch push.Kind(s) {
-	case push.KindMessage, push.KindMention, push.KindCall, push.KindWake:
+	case push.KindMessage, push.KindMention, push.KindCall, push.KindCallEnd, push.KindSecurity, push.KindWake:
 		return push.Kind(s), true
 	default:
 		return "", false

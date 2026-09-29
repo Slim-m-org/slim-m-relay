@@ -10,6 +10,7 @@ import (
 	"context"
 	"log"
 	"sync"
+	"time"
 )
 
 // Platform selects which provider a message is forwarded through.
@@ -32,7 +33,18 @@ const (
 	KindMention Kind = "mention"
 	KindCall    Kind = "call"
 	KindWake    Kind = "wake"
+	// KindCallEnd tells a device a ring it may still be showing has ended, so it can stop.
+	KindCallEnd Kind = "call_end"
+	// KindSecurity is an account security alert, such as a sign-in from a new device.
+	KindSecurity Kind = "security"
 )
+
+// CallSignalTTL bounds how long a provider may hold a call or call_end push for an
+// unreachable device; it matches the home server's ring timeout, past which the ring is over.
+const CallSignalTTL = 30 * time.Second
+
+// IsCallSignal reports whether a push only means anything while its ring is live.
+func (k Kind) IsCallSignal() bool { return k == KindCall || k == KindCallEnd }
 
 // Message is one push bound for one device token. Payload is an opaque blob the home
 // server already encrypted before it ever reached the relay; the relay forwards it
