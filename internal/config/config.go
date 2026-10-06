@@ -5,6 +5,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 )
@@ -96,10 +97,13 @@ type Config struct {
 }
 
 // Load reads configuration from the environment, applying defaults that suit a single
-// maintainer-run relay.
-func Load() Config {
-	return Config{
-		Port:               getint("RELAY_PORT", 8090),
+// maintainer-run relay. A variable that is set but cannot be parsed is an error naming it,
+// never a silent fallback to the default: RELAY_TRUST_PROXY=yes quietly meaning false
+// would key every client on the proxy's address.
+func Load() (Config, error) {
+	p := &parser{}
+	cfg := Config{
+		Port:               p.int("RELAY_PORT", 8090),
 		DBPath:             getenv("RELAY_DB_PATH", "/data/relay.db"),
 		AdminToken:         getenv("RELAY_ADMIN_TOKEN", ""),
 		FCMCredentialsFile: getenv("RELAY_FCM_CREDENTIALS_FILE", ""),
@@ -107,23 +111,24 @@ func Load() Config {
 		APNsKeyID:          getenv("RELAY_APNS_KEY_ID", ""),
 		APNsTeamID:         getenv("RELAY_APNS_TEAM_ID", ""),
 		APNsBundleID:       getenv("RELAY_APNS_BUNDLE_ID", ""),
-		APNsProduction:     getbool("RELAY_APNS_PRODUCTION", true),
-		TrustProxy:         getbool("RELAY_TRUST_PROXY", false),
-		RegisterPerHour:    getint("RELAY_REGISTER_PER_HOUR", 5),
-		RegisterBurst:      getint("RELAY_REGISTER_BURST", 3),
-		MaxRegistrations:   getint("RELAY_MAX_REGISTRATIONS", 10000),
-		SendAdmitPerMinute: getint("RELAY_SEND_ADMIT_PER_MINUTE", 600),
-		SendAdmitBurst:     getint("RELAY_SEND_ADMIT_BURST", 120),
-		SendPerMinute:      getint("RELAY_SEND_PER_MINUTE", 120),
-		SendBurst:          getint("RELAY_SEND_BURST", 60),
-		CallSendPerMinute:  getint("RELAY_CALL_SEND_PER_MINUTE", 10),
-		CallSendBurst:      getint("RELAY_CALL_SEND_BURST", 5),
-		MaxMessages:        getint("RELAY_MAX_MESSAGES", 500),
-		SendConcurrency:    getint("RELAY_SEND_CONCURRENCY", 8),
-		SendTimeoutSeconds: getint("RELAY_SEND_TIMEOUT_SECONDS", 20),
-		TokenRetentionDays: getint("RELAY_TOKEN_RETENTION_DAYS", 90),
-		MaxTokensPerKey:    getint("RELAY_MAX_TOKENS_PER_KEY", 20000),
+		APNsProduction:     p.bool("RELAY_APNS_PRODUCTION", true),
+		TrustProxy:         p.bool("RELAY_TRUST_PROXY", false),
+		RegisterPerHour:    p.int("RELAY_REGISTER_PER_HOUR", 5),
+		RegisterBurst:      p.int("RELAY_REGISTER_BURST", 3),
+		MaxRegistrations:   p.int("RELAY_MAX_REGISTRATIONS", 10000),
+		SendAdmitPerMinute: p.int("RELAY_SEND_ADMIT_PER_MINUTE", 600),
+		SendAdmitBurst:     p.int("RELAY_SEND_ADMIT_BURST", 120),
+		SendPerMinute:      p.int("RELAY_SEND_PER_MINUTE", 120),
+		SendBurst:          p.int("RELAY_SEND_BURST", 60),
+		CallSendPerMinute:  p.int("RELAY_CALL_SEND_PER_MINUTE", 10),
+		CallSendBurst:      p.int("RELAY_CALL_SEND_BURST", 5),
+		MaxMessages:        p.int("RELAY_MAX_MESSAGES", 500),
+		SendConcurrency:    p.int("RELAY_SEND_CONCURRENCY", 8),
+		SendTimeoutSeconds: p.int("RELAY_SEND_TIMEOUT_SECONDS", 20),
+		TokenRetentionDays: p.int("RELAY_TOKEN_RETENTION_DAYS", 90),
+		MaxTokensPerKey:    p.int("RELAY_MAX_TOKENS_PER_KEY", 20000),
 	}
+	return cfg, p.err
 }
 
 func getenv(key, def string) string {
@@ -133,20 +138,37 @@ func getenv(key, def string) string {
 	return def
 }
 
-func getint(key string, def int) int {
-	if v := os.Getenv(key); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			return n
-		}
+// parser reads typed variables and remembers the first one that was set but malformed.
+type parser struct{ err error }
+
+func (p *parser) fail(key, v, want string, cause error) {
+	if p.err == nil {
+		p.err = fmt.Errorf("%s=%q is not %s: %w", key, v, want, cause)
 	}
-	return def
 }
 
-func getbool(key string, def bool) bool {
-	if v := os.Getenv(key); v != "" {
-		if b, err := strconv.ParseBool(v); err == nil {
-			return b
-		}
+func (p *parser) int(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
 	}
-	return def
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		p.fail(key, v, "an integer", err)
+		return def
+	}
+	return n
+}
+
+func (p *parser) bool(key string, def bool) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		p.fail(key, v, "a boolean (true, false, 1, 0)", err)
+		return def
+	}
+	return b
 }

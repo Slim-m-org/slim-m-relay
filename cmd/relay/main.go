@@ -34,7 +34,10 @@ func main() {
 		os.Exit(healthcheck())
 	}
 
-	cfg := config.Load()
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatalf("config: %v", err)
+	}
 
 	androidSender := buildFCM(cfg)
 	iosSender := buildAPNs(cfg)
