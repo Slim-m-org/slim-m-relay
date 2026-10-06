@@ -85,9 +85,10 @@ func main() {
 	_ = httpServer.Shutdown(shutdownCtx)
 }
 
-// buildFCM wires the Android sender. A missing credentials file is not fatal: Android
-// sends fail clearly through push.Unconfigured instead, so the relay still starts and
-// serves everything else (iOS sends, registration, admin, health).
+// buildFCM wires the Android sender. An unset credentials path is not fatal: Android sends
+// fail clearly through push.Unconfigured instead, so the relay still starts and serves
+// everything else (iOS sends, registration, admin, health). A path that is set but
+// unreadable is a startup misconfiguration and fails fast, like a malformed APNs key.
 func buildFCM(cfg config.Config) push.Sender {
 	if cfg.FCMCredentialsFile == "" {
 		log.Println("relay: RELAY_FCM_CREDENTIALS_FILE unset; Android (FCM) sends will fail")

@@ -21,7 +21,7 @@ type Config struct {
 
 	// FCMCredentialsFile points to the Firebase service-account JSON used to send Android
 	// pushes. Empty is not fatal: Android sends fail clearly instead of the relay refusing
-	// to start.
+	// to start. A path that is set but unreadable is.
 	FCMCredentialsFile string
 
 	// APNsKeyPath, APNsKeyID, APNsTeamID and APNsBundleID are the token-based (.p8)
