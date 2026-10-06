@@ -5,6 +5,7 @@ package keys
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -188,7 +189,7 @@ func TestBindToken(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			owner, err := s.BindToken(ctx, tt.keyID, tt.platform, tt.token, 0)
+			owner, err := s.BindToken(ctx, tt.keyID, tt.platform, tt.token, 0, 0)
 			if err != nil {
 				t.Fatalf("bind token: %v", err)
 			}
@@ -207,17 +208,17 @@ func TestBindTokenIndependentTokensDoNotInterfere(t *testing.T) {
 	ka, _ := s.Verify(ctx, keyA)
 	kb, _ := s.Verify(ctx, keyB)
 
-	if owner, err := s.BindToken(ctx, ka.ID, "ios", "tok-a", 0); err != nil || owner != ka.ID {
+	if owner, err := s.BindToken(ctx, ka.ID, "ios", "tok-a", 0, 0); err != nil || owner != ka.ID {
 		t.Fatalf("bind tok-a to A: owner=%d err=%v", owner, err)
 	}
-	if owner, err := s.BindToken(ctx, kb.ID, "ios", "tok-b", 0); err != nil || owner != kb.ID {
+	if owner, err := s.BindToken(ctx, kb.ID, "ios", "tok-b", 0, 0); err != nil || owner != kb.ID {
 		t.Fatalf("bind tok-b to B: owner=%d err=%v", owner, err)
 	}
 	// Neither binding should have disturbed the other.
-	if owner, err := s.BindToken(ctx, kb.ID, "ios", "tok-a", 0); err != nil || owner != ka.ID {
+	if owner, err := s.BindToken(ctx, kb.ID, "ios", "tok-a", 0, 0); err != nil || owner != ka.ID {
 		t.Errorf("tok-a should still be owned by A, got owner=%d err=%v", owner, err)
 	}
-	if owner, err := s.BindToken(ctx, ka.ID, "ios", "tok-b", 0); err != nil || owner != kb.ID {
+	if owner, err := s.BindToken(ctx, ka.ID, "ios", "tok-b", 0, 0); err != nil || owner != kb.ID {
 		t.Errorf("tok-b should still be owned by B, got owner=%d err=%v", owner, err)
 	}
 }
@@ -232,7 +233,7 @@ func TestBindTokenPrunesTokensStaleBeyondRetention(t *testing.T) {
 	keyA, _ := s.Issue(ctx, "", 0)
 	ka, _ := s.Verify(ctx, keyA)
 
-	if _, err := s.BindToken(ctx, ka.ID, "ios", "stale-token", time.Hour); err != nil {
+	if _, err := s.BindToken(ctx, ka.ID, "ios", "stale-token", time.Hour, 0); err != nil {
 		t.Fatalf("bind stale token: %v", err)
 	}
 	// Age the binding far past a 24h retention window, as if nobody had sent to it since.
@@ -246,7 +247,7 @@ func TestBindTokenPrunesTokensStaleBeyondRetention(t *testing.T) {
 	s.pruneMu.Unlock()
 
 	// Binding an unrelated fresh token is what triggers the sweep.
-	if _, err := s.BindToken(ctx, ka.ID, "ios", "fresh-token", 24*time.Hour); err != nil {
+	if _, err := s.BindToken(ctx, ka.ID, "ios", "fresh-token", 24*time.Hour, 0); err != nil {
 		t.Fatalf("bind fresh token: %v", err)
 	}
 
@@ -274,7 +275,7 @@ func TestBindTokenZeroRetentionDisablesPruning(t *testing.T) {
 	keyA, _ := s.Issue(ctx, "", 0)
 	ka, _ := s.Verify(ctx, keyA)
 
-	if _, err := s.BindToken(ctx, ka.ID, "ios", "ancient-token", 0); err != nil {
+	if _, err := s.BindToken(ctx, ka.ID, "ios", "ancient-token", 0, 0); err != nil {
 		t.Fatalf("bind: %v", err)
 	}
 	old := time.Now().Add(-24 * 365 * time.Hour).Unix() // a year stale
@@ -285,7 +286,7 @@ func TestBindTokenZeroRetentionDisablesPruning(t *testing.T) {
 	s.lastPrune = time.Now().Add(-2 * pruneInterval)
 	s.pruneMu.Unlock()
 
-	if _, err := s.BindToken(ctx, ka.ID, "ios", "another-token", 0); err != nil {
+	if _, err := s.BindToken(ctx, ka.ID, "ios", "another-token", 0, 0); err != nil {
 		t.Fatalf("bind: %v", err)
 	}
 
@@ -344,7 +345,7 @@ INSERT INTO tokens (platform, token, key_id, created_at) VALUES ('ios', 'establi
 	// Force the prune to be due, then drive it through a bind by an unrelated key.
 	s.lastPrune = time.Time{}
 	ctx := context.Background()
-	if _, err := s.BindToken(ctx, 1, "ios", "some-other-token", 24*time.Hour); err != nil {
+	if _, err := s.BindToken(ctx, 1, "ios", "some-other-token", 24*time.Hour, 0); err != nil {
 		t.Fatalf("bind: %v", err)
 	}
 
@@ -357,5 +358,32 @@ INSERT INTO tokens (platform, token, key_id, created_at) VALUES ('ios', 'establi
 	}
 	if owner != 1 {
 		t.Fatalf("binding owner = %d, want 1", owner)
+	}
+}
+
+func TestBindTokenCapsNewBindingsPerKey(t *testing.T) {
+	s := openTemp(t)
+	ctx := context.Background()
+	keyA, _ := s.Issue(ctx, "", 0)
+	ka, _ := s.Verify(ctx, keyA)
+	keyB, _ := s.Issue(ctx, "", 0)
+	kb, _ := s.Verify(ctx, keyB)
+
+	for _, tok := range []string{"t1", "t2"} {
+		if _, err := s.BindToken(ctx, ka.ID, "ios", tok, 0, 2); err != nil {
+			t.Fatalf("bind %s under the cap: %v", tok, err)
+		}
+	}
+	if _, err := s.BindToken(ctx, ka.ID, "ios", "t3", 0, 2); !errors.Is(err, ErrTokenLimit) {
+		t.Fatalf("third bind = %v, want ErrTokenLimit", err)
+	}
+	if owner, err := s.BindToken(ctx, ka.ID, "ios", "t1", 0, 2); err != nil || owner != ka.ID {
+		t.Fatalf("an owned token at the cap = (%d, %v), want it to keep working", owner, err)
+	}
+	if _, err := s.BindToken(ctx, kb.ID, "ios", "t3", 0, 2); err != nil {
+		t.Fatalf("another key has its own budget: %v", err)
+	}
+	if _, err := s.BindToken(ctx, ka.ID, "ios", "t4", 0, 0); err != nil {
+		t.Fatalf("zero disables the cap: %v", err)
 	}
 }

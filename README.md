@@ -44,6 +44,7 @@ Because device tokens are opaque strings that a server could in principle send t
 Every later send to that token must come from the same key.
 A send from a different key for a token it does not own is rejected with `forbidden`, and never reaches APNs or FCM.
 This keeps one self-hosted server from harassing another server's devices, even if it somehow obtained their tokens.
+A token must be 1 to 1024 printable ASCII characters with no whitespace (the server already refuses to register a longer one), or it comes back as `error` and is never stored.
 A binding its owner has not sent to within `RELAY_TOKEN_RETENTION_DAYS` is pruned, so the tokens table - which, unlike the keys table, grows at a rate the caller controls with every send - stays bounded; a device token the provider has already reported dead is worthless to keep, and an actively used one is never at risk since every legitimate send resets its clock.
 
 ## API
@@ -125,6 +126,7 @@ The `/data` volume holds the SQLite key store; back it up, since losing it means
 | `RELAY_SEND_CONCURRENCY` | `8` | Provider sends run at once, per `/v1/send` request, through a bounded worker pool. |
 | `RELAY_SEND_TIMEOUT_SECONDS` | `20` | Hard wall-clock deadline for one `/v1/send` request's provider dispatch. A message not yet attempted when it fires comes back as `not_attempted`. `0` or negative disables the deadline entirely rather than expiring it instantly. |
 | `RELAY_TOKEN_RETENTION_DAYS` | `90` | How long a device-token binding may go without its owning key sending to it before it is pruned. A send always refreshes the clock, so an actively used token is never at risk. `0` or negative disables pruning, leaving the tokens table to grow without bound. |
+| `RELAY_MAX_TOKENS_PER_KEY` | `20000` | How many device tokens one key may have bound. A new token past it comes back as `error`; one the key already owns keeps working. `0` or negative disables the cap. |
 
 ## Development
 

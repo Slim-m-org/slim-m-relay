@@ -103,7 +103,8 @@ CREATE TABLE IF NOT EXISTS tokens (
 	created_at   INTEGER NOT NULL,
 	last_seen_at INTEGER NOT NULL DEFAULT 0,
 	UNIQUE(platform, token)
-);`)
+);
+CREATE INDEX IF NOT EXISTS tokens_key_id ON tokens(key_id);`)
 	if err != nil {
 		return err
 	}
@@ -245,11 +246,17 @@ func (s *Store) Revoke(ctx context.Context, id int64) error {
 	return nil
 }
 
+// ErrTokenLimit is returned by BindToken when a key already holds its maximum of bound tokens.
+var ErrTokenLimit = errors.New("keys: token limit reached")
+
 // BindToken enforces harassment-hardening: a device push token is bound, per platform, to
 // whichever key first sends to it, and every later send for that token must come from the
 // same key. It returns the id of the key that owns the token - keyID itself on a fresh
 // binding, or the original owner if the token was already claimed by someone else - so the
 // caller can compare the two and reject a mismatch without a second round trip.
+//
+// maxPerKey caps how many bindings keyID may hold; a new token past it gets ErrTokenLimit
+// and a token the key already owns still succeeds. Zero or negative disables the cap.
 //
 // retention bounds how long a binding may go untouched by its owning key before it becomes
 // eligible for pruning (see maybePruneStaleTokens); zero or negative disables pruning. A
@@ -258,7 +265,7 @@ func (s *Store) Revoke(ctx context.Context, id int64) error {
 //
 // The read-then-write here is race-free because Open sets SetMaxOpenConns(1): the whole
 // relay shares one connection, so this transaction can never interleave with another.
-func (s *Store) BindToken(ctx context.Context, keyID int64, platform, token string, retention time.Duration) (int64, error) {
+func (s *Store) BindToken(ctx context.Context, keyID int64, platform, token string, retention time.Duration, maxPerKey int) (int64, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
@@ -271,6 +278,15 @@ func (s *Store) BindToken(ctx context.Context, keyID int64, platform, token stri
 		`SELECT key_id FROM tokens WHERE platform = ? AND token = ?`, platform, token).Scan(&owner)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
+		if maxPerKey > 0 {
+			var bound int
+			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM tokens WHERE key_id = ?`, keyID).Scan(&bound); err != nil {
+				return 0, err
+			}
+			if bound >= maxPerKey {
+				return 0, ErrTokenLimit
+			}
+		}
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO tokens (platform, token, key_id, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?)`,
 			platform, token, keyID, now, now); err != nil {

@@ -88,6 +88,11 @@ type Config struct {
 	// unseen tokens - is ever removed. Zero or negative disables pruning, leaving the tokens
 	// table to grow without bound.
 	TokenRetentionDays int
+
+	// MaxTokensPerKey caps how many device-token bindings one key may hold, so a registered
+	// key cannot grow the store without bound. A real deployment binds roughly one token per
+	// device of its members. Zero or negative disables the cap.
+	MaxTokensPerKey int
 }
 
 // Load reads configuration from the environment, applying defaults that suit a single
@@ -117,6 +122,7 @@ func Load() Config {
 		SendConcurrency:    getint("RELAY_SEND_CONCURRENCY", 8),
 		SendTimeoutSeconds: getint("RELAY_SEND_TIMEOUT_SECONDS", 20),
 		TokenRetentionDays: getint("RELAY_TOKEN_RETENTION_DAYS", 90),
+		MaxTokensPerKey:    getint("RELAY_MAX_TOKENS_PER_KEY", 20000),
 	}
 }
 
