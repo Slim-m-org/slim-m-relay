@@ -53,12 +53,12 @@ func New(ctx context.Context, credentialsJSON []byte) (*Sender, error) {
 	httpClient := &http.Client{Timeout: 15 * time.Second}
 	// The oauth2.TokenSource interface's Token() takes no context or per-call deadline, so
 	// the only way to bound how long a token refresh can block is the http.Client captured
-	// in the context CredentialsFromJSON is given here - that client is what every future
+	// in the context CredentialsFromJSONWithType is given here - that client is what every future
 	// refresh through creds.TokenSource uses, for the lifetime of the Sender. Without this,
 	// a blackholed token endpoint hangs Token() forever on http.DefaultClient, which has no
 	// timeout, and no per-request deadline can ever cut that off.
 	ctx = context.WithValue(ctx, oauth2.HTTPClient, httpClient)
-	creds, err := google.CredentialsFromJSON(ctx, credentialsJSON, scope)
+	creds, err := google.CredentialsFromJSONWithType(ctx, credentialsJSON, google.ServiceAccount, scope)
 	if err != nil {
 		return nil, fmt.Errorf("parse FCM credentials: %w", err)
 	}
