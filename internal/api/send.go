@@ -4,6 +4,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"log"
 	"net/http"
 	"strconv"
@@ -35,6 +36,26 @@ type sendResp struct {
 // maxPayloadBytes bounds one message's opaque payload. 4096 matches APNs' own remote
 // notification payload ceiling, the tighter of the two providers' limits.
 const maxPayloadBytes = 4096
+
+// maxTokenBytes bounds a device token. slim-m's server already refuses to register a
+// token over 1024 characters, so no real client token is longer.
+const maxTokenBytes = 1024
+
+// validToken reports whether token has the shape of a real APNs or FCM token: bounded and
+// printable ASCII with no whitespace. The server only length-checks tokens, so this is
+// deliberately not stricter per platform than what it will register; it exists so a caller
+// cannot make the relay store arbitrary bytes.
+func validToken(token string) bool {
+	if token == "" || len(token) > maxTokenBytes {
+		return false
+	}
+	for i := 0; i < len(token); i++ {
+		if c := token[i]; c <= ' ' || c > '~' {
+			return false
+		}
+	}
+	return true
+}
 
 // dispatchItem is one message ready to send, paired with the platform sender it must go
 // through and the slot in results it belongs in, so a single bounded worker pool can drain
@@ -100,6 +121,10 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		if m.Token == "" {
 			continue
 		}
+		if !validToken(m.Token) {
+			results = append(results, push.Result{Token: m.Token, Status: push.StatusError})
+			continue
+		}
 		if len(m.Payload) > maxPayloadBytes {
 			results = append(results, push.Result{Token: m.Token, Status: push.StatusError})
 			continue
@@ -121,9 +146,11 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		retention := time.Duration(s.cfg.TokenRetentionDays) * 24 * time.Hour
-		owner, err := s.keys.BindToken(r.Context(), k.ID, string(platform), m.Token, retention)
+		owner, err := s.keys.BindToken(r.Context(), k.ID, string(platform), m.Token, retention, s.cfg.MaxTokensPerKey)
 		if err != nil {
-			log.Printf("relay: bind token: %v", err)
+			if !errors.Is(err, keys.ErrTokenLimit) {
+				log.Printf("relay: bind token: %v", err)
+			}
 			results = append(results, push.Result{Token: m.Token, Status: push.StatusError})
 			continue
 		}
