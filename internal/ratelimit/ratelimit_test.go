@@ -130,3 +130,26 @@ func TestRefillsOverTime(t *testing.T) {
 		t.Fatal("after ~2s of refill the call should be allowed again")
 	}
 }
+
+// A 5 per hour burst 3 limiter needs 36 minutes to refill, so an 11 minute idle sweep must not reset it.
+func TestEvictionDoesNotResetASlowLimiter(t *testing.T) {
+	l := New(5.0/60.0, 3) // same construction as api.New for RELAY_REGISTER_PER_HOUR=5, BURST=3
+	for i := 0; i < 3; i++ {
+		if !l.Allow("ip") {
+			t.Fatalf("burst call %d denied", i+1)
+		}
+	}
+	if l.Allow("ip") {
+		t.Fatal("4th immediate call should be denied")
+	}
+
+	l.mu.Lock()
+	l.buckets["ip"].last = time.Now().Add(-11 * time.Minute)
+	l.lastEvict = time.Now().Add(-2 * evictInterval)
+	l.mu.Unlock()
+
+	// 11 minutes at 5/hour is about 0.9 tokens, so still under one: must be denied.
+	if l.Allow("ip") {
+		t.Fatal("allowed after 11 idle minutes: eviction handed back a full burst, only ~0.9 token would have refilled")
+	}
+}
