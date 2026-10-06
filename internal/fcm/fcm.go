@@ -150,13 +150,16 @@ func (s *Sender) sendOne(ctx context.Context, url, access string, m push.Message
 	if resp.StatusCode < 300 {
 		return push.StatusDelivered
 	}
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
+	code := errorCode(raw)
+	if (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) && code != "SENDER_ID_MISMATCH" {
 		// Whole-pipeline credential death, not per-token noise: the service account is
 		// rejected outright, so every android send fails until the operator fixes it.
+		// SENDER_ID_MISMATCH is the one 403 that is per-token (a token minted for another
+		// Firebase project), so it falls through to be pruned below.
 		log.Printf("relay: fcm rejected the service-account credential (http %d); every android send will fail until it is fixed", resp.StatusCode)
 		return push.StatusError
 	}
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
 	if resp.StatusCode == http.StatusBadRequest && tokenFieldViolation(raw) {
 		// Live FCM v1 reports a malformed or corrupt registration token as HTTP 400
 		// INVALID_ARGUMENT with a BadRequest field violation naming "message.token", not as
@@ -166,7 +169,7 @@ func (s *Sender) sendOne(ctx context.Context, url, access string, m push.Message
 		// server bug and must stay StatusError.
 		return push.StatusUnregistered
 	}
-	if errorCode(raw) == "UNREGISTERED" {
+	if code == "UNREGISTERED" || code == "SENDER_ID_MISMATCH" {
 		return push.StatusUnregistered
 	}
 	return push.StatusError
