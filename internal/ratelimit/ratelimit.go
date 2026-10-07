@@ -81,9 +81,19 @@ func (l *Limiter) Return(key string) {
 	}
 }
 
-// evictIdle removes buckets untouched for 10 minutes. Must be called with l.mu held.
+// minIdleBeforeEvict is the shortest idle time before a bucket is dropped, however fast it refills.
+const minIdleBeforeEvict = 10 * time.Minute
+
+// evictIdle drops buckets that have sat idle long enough to be full again, so a dropped
+// bucket and a fresh one behave the same. Must be called with l.mu held.
 func (l *Limiter) evictIdle(now time.Time) {
-	cutoff := now.Add(-10 * time.Minute)
+	idle := minIdleBeforeEvict
+	if l.rate > 0 {
+		if refill := time.Duration(l.burst / l.rate * float64(time.Second)); refill > idle {
+			idle = refill
+		}
+	}
+	cutoff := now.Add(-idle)
 	for k, b := range l.buckets {
 		if b.last.Before(cutoff) {
 			delete(l.buckets, k)

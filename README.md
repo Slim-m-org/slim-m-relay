@@ -37,6 +37,7 @@ Keys are stored as SHA-256 hashes in a small SQLite file, so a leak of the datab
 Registration is rate-limited per IP, capped overall by `RELAY_MAX_REGISTRATIONS`, and sending is rate-limited per key, with a tighter limit specifically on `call` kind pushes since a call rings a device and is the most abusable kind.
 Rate limiting is per-instance and in-process: it lives in the relay's own memory, not a shared store, so running more than one replica multiplies the effective limits rather than sharing one budget across them.
 A misbehaving server can be cut off with `POST /admin/keys/{id}/revoke`.
+Revoking a key also releases the device tokens it owned, so another key can claim them.
 
 ### Token-to-key binding
 

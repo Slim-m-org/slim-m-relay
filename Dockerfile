@@ -1,5 +1,5 @@
 # Multi-stage build producing a tiny static binary on a distroless base.
-FROM golang:1.26-alpine AS build
+FROM golang:1.26-alpine@sha256:8ac98ca534ac3f51e1f420a1dd2c15e74c75cfa0f23f3ad27eb5d7236c349a0c AS build
 WORKDIR /src
 
 # Cache modules first.
@@ -14,7 +14,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/relay .
 # this the volume defaults to root-owned and the nonroot process can't write the key store.
 RUN mkdir -p /data && touch /data/.keep
 
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
 WORKDIR /app
 COPY --from=build /out/relay /app/relay
 COPY --from=build --chown=65532:65532 /data /data

@@ -23,7 +23,14 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # A tag on a red commit must not publish and sign an image, so the same checks ci runs
+  # gate the build. Manual dispatch is limited to main for the same reason.
+  ci:
+    if: github.ref_type == 'tag' || github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/ci.yml
+
   image:
+    needs: [ci]
     strategy:
       fail-fast: false
       matrix:
@@ -108,14 +115,14 @@ jobs:
           for f in /tmp/digests/*; do
             refs+=("${IMAGE}@$(cat "$f")")
           done
-          # `latest` is the rolling tag the deployment tracks for auto-updates;
-          # the version and sha tags stay so an image can be pinned and traced
-          # back to its commit.
-          docker buildx imagetools create \
-            -t "${IMAGE}:${version}" \
-            -t "${IMAGE}:sha-${GITHUB_SHA}" \
-            -t "${IMAGE}:latest" \
-            "${refs[@]}"
+          tags=(-t "${IMAGE}:${version}" -t "${IMAGE}:sha-${GITHUB_SHA}")
+          # `latest` is the rolling tag the deployment tracks for auto-updates, so only a
+          # stable tag moves it: a prerelease tag (v0.2.0-rc1) or a manual dispatch gets the
+          # version and sha tags alone, which still lets an image be pinned and traced.
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [[ "${version}" != *-* ]]; then
+            tags+=(-t "${IMAGE}:latest")
+          fi
+          docker buildx imagetools create "${tags[@]}" "${refs[@]}"
           digest="$(docker buildx imagetools inspect "${IMAGE}:${version}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
           echo "digest=${digest}" >> "$GITHUB_OUTPUT"
 

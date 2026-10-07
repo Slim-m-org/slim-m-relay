@@ -233,9 +233,16 @@ func (s *Store) List(ctx context.Context) ([]Key, error) {
 	return out, rows.Err()
 }
 
-// Revoke marks a key unusable. Returns ErrNotFound if no such (unrevoked) key exists.
+// Revoke marks a key unusable and releases its device-token bindings, so the devices it
+// owned can be claimed by another key. Returns ErrNotFound if no such (unrevoked) key exists.
 func (s *Store) Revoke(ctx context.Context, id int64) error {
-	res, err := s.db.ExecContext(ctx,
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	res, err := tx.ExecContext(ctx,
 		`UPDATE keys SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL`, time.Now().Unix(), id)
 	if err != nil {
 		return err
@@ -243,7 +250,10 @@ func (s *Store) Revoke(ctx context.Context, id int64) error {
 	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrNotFound
 	}
-	return nil
+	if _, err := tx.ExecContext(ctx, `DELETE FROM tokens WHERE key_id = ?`, id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // ErrTokenLimit is returned by BindToken when a key already holds its maximum of bound tokens.
