@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 
 	"github.com/nc1107/slim-m-relay/internal/push"
@@ -55,20 +56,54 @@ func bearerToken(r *http.Request) string {
 // appends its view of the peer to X-Forwarded-For, so the leftmost entry is whatever the
 // client itself put there - fully attacker-controlled - and trusting it lets one caller
 // spin up an unbounded number of distinct rate-limit buckets just by varying the header.
-// Only when the operator opts in with RELAY_TRUST_PROXY is the header read at all, and even
-// then it is the rightmost entry that is trusted, since that is the one hop a trusted
-// proxy itself appended and an external caller cannot forge.
+// Only when the operator opts in with RELAY_TRUST_PROXY is the header read at all, and then
+// it is the entry TrustProxyHops places from the right, since those are the hops trusted
+// proxies themselves appended and an external caller cannot forge. A header too short for
+// that, or an entry that is not an IP, falls back to the peer address.
+//
+// The result is normalised by limiterKey, so one IPv6 /64 is one bucket.
 func (s *Server) clientIP(r *http.Request) string {
+	peer := r.RemoteAddr
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		peer = host
+	}
 	if s.cfg.TrustProxy {
 		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 			parts := strings.Split(xff, ",")
-			return strings.TrimSpace(parts[len(parts)-1])
+			hops := s.cfg.TrustProxyHops
+			if hops < 1 {
+				hops = 1
+			}
+			if hops <= len(parts) {
+				if ip := strings.TrimSpace(parts[len(parts)-hops]); isIP(ip) {
+					return limiterKey(ip)
+				}
+			}
 		}
 	}
-	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		return host
+	return limiterKey(peer)
+}
+
+func isIP(s string) bool {
+	_, err := netip.ParseAddr(s)
+	return err == nil
+}
+
+// limiterKey maps an address to its rate-limit bucket: an IPv4 address is its own bucket
+// (IPv4-mapped IPv6 is unmapped first), an IPv6 address collapses to its /64 because a
+// single ordinary allocation holds 2^64 addresses a caller could rotate through. Anything
+// that is not an IP literal is returned as is.
+func limiterKey(addr string) string {
+	ip, err := netip.ParseAddr(strings.TrimSpace(addr))
+	if err != nil {
+		return addr
 	}
-	return r.RemoteAddr
+	ip = ip.Unmap().WithZone("")
+	if ip.Is6() {
+		prefix, _ := ip.Prefix(64)
+		return prefix.String()
+	}
+	return ip.String()
 }
 
 // recoverer turns a handler panic into a 500 instead of crashing the process.

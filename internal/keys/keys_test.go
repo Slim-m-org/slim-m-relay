@@ -153,74 +153,111 @@ func TestDistinctKeysHashDistinctly(t *testing.T) {
 	}
 }
 
-// TestBindToken exercises the harassment-hardening rule end to end: a token is bound to
-// whichever key first claims it, later sends from that same key keep working, sends from a
-// different key are rejected (the original owner is reported back, not the challenger), and
-// the same raw token string on a different platform is an entirely separate binding.
-//
-// The cases build on each other's state and must run in the order given, unlike a typical
-// independent table-driven test - each row is a step in one scenario against one store.
-func TestBindToken(t *testing.T) {
-	s := openTemp(t)
-	ctx := context.Background()
-
-	keyA, _ := s.Issue(ctx, "server-a", 0)
-	keyB, _ := s.Issue(ctx, "server-b", 0)
-	ka, err := s.Verify(ctx, keyA)
-	if err != nil {
-		t.Fatalf("verify key A: %v", err)
-	}
-	kb, err := s.Verify(ctx, keyB)
-	if err != nil {
-		t.Fatalf("verify key B: %v", err)
-	}
-
-	tests := []struct {
-		name     string
-		platform string
-		token    string
-		keyID    int64
-		want     int64
-	}{
-		{"first claim by A establishes ownership", "ios", "device-token-1", ka.ID, ka.ID},
-		{"A sending again to its own token stays fine", "ios", "device-token-1", ka.ID, ka.ID},
-		{"B sending to A's token is rejected; A stays owner", "ios", "device-token-1", kb.ID, ka.ID},
-		{"same raw token string on Android is a separate binding, owned by B", "android", "device-token-1", kb.ID, kb.ID},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			owner, err := s.BindToken(ctx, tt.keyID, tt.platform, tt.token, 0, 0)
-			if err != nil {
-				t.Fatalf("bind token: %v", err)
-			}
-			if owner != tt.want {
-				t.Errorf("owner = %d, want %d", owner, tt.want)
-			}
-		})
+func bindOK(t *testing.T, s *Store, keyID int64, platform, tok string, lim BindLimits) {
+	t.Helper()
+	if err := s.BindToken(context.Background(), keyID, platform, tok, lim); err != nil {
+		t.Fatalf("bind %s for key %d: %v", tok, keyID, err)
 	}
 }
 
-func TestBindTokenIndependentTokensDoNotInterfere(t *testing.T) {
+func twoKeys(t *testing.T, s *Store) (int64, int64) {
+	t.Helper()
+	ctx := context.Background()
+	a, _ := s.Issue(ctx, "", 0)
+	b, _ := s.Issue(ctx, "", 0)
+	ka, _ := s.Verify(ctx, a)
+	kb, _ := s.Verify(ctx, b)
+	return ka.ID, kb.ID
+}
+
+func TestTwoKeysShareOneToken(t *testing.T) {
+	s := openTemp(t)
+	a, b := twoKeys(t, s)
+	lim := BindLimits{MaxKeysPerToken: 8}
+	bindOK(t, s, a, "ios", "device-token-1", lim)
+	bindOK(t, s, b, "ios", "device-token-1", lim)
+	bindOK(t, s, a, "ios", "device-token-1", lim)
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM tokens WHERE token = 'device-token-1'`).Scan(&n); err != nil || n != 2 {
+		t.Fatalf("bindings = %d (%v), want one per key", n, err)
+	}
+}
+
+func TestBindTokenPlatformsAreSeparate(t *testing.T) {
+	s := openTemp(t)
+	a, b := twoKeys(t, s)
+	lim := BindLimits{MaxKeysPerToken: 1}
+	bindOK(t, s, a, "ios", "tok", lim)
+	bindOK(t, s, b, "android", "tok", lim)
+}
+
+func TestTokenKeyCapRefusesAnotherKey(t *testing.T) {
 	s := openTemp(t)
 	ctx := context.Background()
-	keyA, _ := s.Issue(ctx, "", 0)
-	keyB, _ := s.Issue(ctx, "", 0)
-	ka, _ := s.Verify(ctx, keyA)
-	kb, _ := s.Verify(ctx, keyB)
+	lim := BindLimits{MaxKeysPerToken: 2}
+	var ids []int64
+	for i := 0; i < 3; i++ {
+		k, _ := s.Issue(ctx, "", 0)
+		kk, _ := s.Verify(ctx, k)
+		ids = append(ids, kk.ID)
+	}
+	bindOK(t, s, ids[0], "ios", "tok", lim)
+	bindOK(t, s, ids[1], "ios", "tok", lim)
+	if err := s.BindToken(ctx, ids[2], "ios", "tok", lim); !errors.Is(err, ErrTokenKeyLimit) {
+		t.Fatalf("third key = %v, want ErrTokenKeyLimit", err)
+	}
+	bindOK(t, s, ids[0], "ios", "tok", lim)
+}
 
-	if owner, err := s.BindToken(ctx, ka.ID, "ios", "tok-a", 0, 0); err != nil || owner != ka.ID {
-		t.Fatalf("bind tok-a to A: owner=%d err=%v", owner, err)
+// A hostile server that fills a token's slots must not lock real servers out for good.
+func TestFullTokenAdmitsKeyOnlyByReplacingIdleBinding(t *testing.T) {
+	s := openTemp(t)
+	ctx := context.Background()
+	lim := BindLimits{MaxKeysPerToken: 2, BindingIdle: 24 * time.Hour}
+	var ids []int64
+	for i := 0; i < 3; i++ {
+		k, _ := s.Issue(ctx, "", 0)
+		kk, _ := s.Verify(ctx, k)
+		ids = append(ids, kk.ID)
 	}
-	if owner, err := s.BindToken(ctx, kb.ID, "ios", "tok-b", 0, 0); err != nil || owner != kb.ID {
-		t.Fatalf("bind tok-b to B: owner=%d err=%v", owner, err)
+	bindOK(t, s, ids[0], "ios", "tok", lim)
+	bindOK(t, s, ids[1], "ios", "tok", lim)
+	old := time.Now().Add(-48 * time.Hour).Unix()
+	if _, err := s.db.Exec(`UPDATE tokens SET last_seen_at = ? WHERE key_id = ?`, old, ids[0]); err != nil {
+		t.Fatal(err)
 	}
-	// Neither binding should have disturbed the other.
-	if owner, err := s.BindToken(ctx, kb.ID, "ios", "tok-a", 0, 0); err != nil || owner != ka.ID {
-		t.Errorf("tok-a should still be owned by A, got owner=%d err=%v", owner, err)
+	bindOK(t, s, ids[2], "ios", "tok", lim)
+	if err := s.BindToken(ctx, ids[0], "ios", "tok", lim); !errors.Is(err, ErrTokenKeyLimit) {
+		t.Fatalf("the evicted key = %v, want ErrTokenKeyLimit while the others stay active", err)
 	}
-	if owner, err := s.BindToken(ctx, ka.ID, "ios", "tok-b", 0, 0); err != nil || owner != kb.ID {
-		t.Errorf("tok-b should still be owned by B, got owner=%d err=%v", owner, err)
+}
+
+func TestOldSingleKeyBindingsSurviveTheUpgradeAndCanBeShared(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "relay.db")
+	old, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
 	}
+	if _, err := old.Exec(`CREATE TABLE keys (
+	id INTEGER PRIMARY KEY AUTOINCREMENT, key_hash TEXT NOT NULL UNIQUE, label TEXT NOT NULL DEFAULT '',
+	created_at INTEGER NOT NULL, last_used_at INTEGER, revoked_at INTEGER);
+CREATE TABLE tokens (
+	id INTEGER PRIMARY KEY AUTOINCREMENT, platform TEXT NOT NULL, token TEXT NOT NULL,
+	key_id INTEGER NOT NULL REFERENCES keys(id), created_at INTEGER NOT NULL,
+	last_seen_at INTEGER NOT NULL DEFAULT 0, UNIQUE(platform, token));
+INSERT INTO keys (id, key_hash, created_at) VALUES (1, 'a', 1), (2, 'b', 1);
+INSERT INTO tokens (platform, token, key_id, created_at, last_seen_at) VALUES ('ios', 'dev', 1, 1, 5);`); err != nil {
+		t.Fatal(err)
+	}
+	_ = old.Close()
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("open after upgrade: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	lim := BindLimits{MaxKeysPerToken: 8}
+	bindOK(t, s, 1, "ios", "dev", lim)
+	bindOK(t, s, 2, "ios", "dev", lim)
 }
 
 // TestBindTokenPrunesTokensStaleBeyondRetention exercises the fix for the tokens table
@@ -233,7 +270,7 @@ func TestBindTokenPrunesTokensStaleBeyondRetention(t *testing.T) {
 	keyA, _ := s.Issue(ctx, "", 0)
 	ka, _ := s.Verify(ctx, keyA)
 
-	if _, err := s.BindToken(ctx, ka.ID, "ios", "stale-token", time.Hour, 0); err != nil {
+	if err := s.BindToken(ctx, ka.ID, "ios", "stale-token", BindLimits{Retention: time.Hour}); err != nil {
 		t.Fatalf("bind stale token: %v", err)
 	}
 	// Age the binding far past a 24h retention window, as if nobody had sent to it since.
@@ -247,7 +284,7 @@ func TestBindTokenPrunesTokensStaleBeyondRetention(t *testing.T) {
 	s.pruneMu.Unlock()
 
 	// Binding an unrelated fresh token is what triggers the sweep.
-	if _, err := s.BindToken(ctx, ka.ID, "ios", "fresh-token", 24*time.Hour, 0); err != nil {
+	if err := s.BindToken(ctx, ka.ID, "ios", "fresh-token", BindLimits{Retention: 24 * time.Hour}); err != nil {
 		t.Fatalf("bind fresh token: %v", err)
 	}
 
@@ -275,7 +312,7 @@ func TestBindTokenZeroRetentionDisablesPruning(t *testing.T) {
 	keyA, _ := s.Issue(ctx, "", 0)
 	ka, _ := s.Verify(ctx, keyA)
 
-	if _, err := s.BindToken(ctx, ka.ID, "ios", "ancient-token", 0, 0); err != nil {
+	if err := s.BindToken(ctx, ka.ID, "ios", "ancient-token", BindLimits{}); err != nil {
 		t.Fatalf("bind: %v", err)
 	}
 	old := time.Now().Add(-24 * 365 * time.Hour).Unix() // a year stale
@@ -286,7 +323,7 @@ func TestBindTokenZeroRetentionDisablesPruning(t *testing.T) {
 	s.lastPrune = time.Now().Add(-2 * pruneInterval)
 	s.pruneMu.Unlock()
 
-	if _, err := s.BindToken(ctx, ka.ID, "ios", "another-token", 0, 0); err != nil {
+	if err := s.BindToken(ctx, ka.ID, "ios", "another-token", BindLimits{}); err != nil {
 		t.Fatalf("bind: %v", err)
 	}
 
@@ -345,7 +382,7 @@ INSERT INTO tokens (platform, token, key_id, created_at) VALUES ('ios', 'establi
 	// Force the prune to be due, then drive it through a bind by an unrelated key.
 	s.lastPrune = time.Time{}
 	ctx := context.Background()
-	if _, err := s.BindToken(ctx, 1, "ios", "some-other-token", 24*time.Hour, 0); err != nil {
+	if err := s.BindToken(ctx, 1, "ios", "some-other-token", BindLimits{Retention: 24 * time.Hour}); err != nil {
 		t.Fatalf("bind: %v", err)
 	}
 
@@ -369,21 +406,14 @@ func TestBindTokenCapsNewBindingsPerKey(t *testing.T) {
 	keyB, _ := s.Issue(ctx, "", 0)
 	kb, _ := s.Verify(ctx, keyB)
 
+	lim := BindLimits{MaxPerKey: 2}
 	for _, tok := range []string{"t1", "t2"} {
-		if _, err := s.BindToken(ctx, ka.ID, "ios", tok, 0, 2); err != nil {
-			t.Fatalf("bind %s under the cap: %v", tok, err)
-		}
+		bindOK(t, s, ka.ID, "ios", tok, lim)
 	}
-	if _, err := s.BindToken(ctx, ka.ID, "ios", "t3", 0, 2); !errors.Is(err, ErrTokenLimit) {
+	if err := s.BindToken(ctx, ka.ID, "ios", "t3", lim); !errors.Is(err, ErrTokenLimit) {
 		t.Fatalf("third bind = %v, want ErrTokenLimit", err)
 	}
-	if owner, err := s.BindToken(ctx, ka.ID, "ios", "t1", 0, 2); err != nil || owner != ka.ID {
-		t.Fatalf("an owned token at the cap = (%d, %v), want it to keep working", owner, err)
-	}
-	if _, err := s.BindToken(ctx, kb.ID, "ios", "t3", 0, 2); err != nil {
-		t.Fatalf("another key has its own budget: %v", err)
-	}
-	if _, err := s.BindToken(ctx, ka.ID, "ios", "t4", 0, 0); err != nil {
-		t.Fatalf("zero disables the cap: %v", err)
-	}
+	bindOK(t, s, ka.ID, "ios", "t1", lim)
+	bindOK(t, s, kb.ID, "ios", "t3", lim)
+	bindOK(t, s, ka.ID, "ios", "t4", BindLimits{})
 }

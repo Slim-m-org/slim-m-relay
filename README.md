@@ -37,16 +37,26 @@ Keys are stored as SHA-256 hashes in a small SQLite file, so a leak of the datab
 Registration is rate-limited per IP, capped overall by `RELAY_MAX_REGISTRATIONS`, and sending is rate-limited per key, with a tighter limit specifically on `call` kind pushes since a call rings a device and is the most abusable kind.
 Rate limiting is per-instance and in-process: it lives in the relay's own memory, not a shared store, so running more than one replica multiplies the effective limits rather than sharing one budget across them.
 A misbehaving server can be cut off with `POST /admin/keys/{id}/revoke`.
-Revoking a key also releases the device tokens it owned, so another key can claim them.
+Revoking a key also drops its device-token bindings.
 
 ### Token-to-key binding
 
-Because device tokens are opaque strings that a server could in principle send to any registered token, the relay adds one hardening rule beyond scoped keys: the first key to send to a given `(platform, token)` pair becomes that token's owner in the same SQLite store, for as long as that key keeps sending to it.
-Every later send to that token must come from the same key.
-A send from a different key for a token it does not own is rejected with `forbidden`, and never reaches APNs or FCM.
-This keeps one self-hosted server from harassing another server's devices, even if it somehow obtained their tokens.
+Device tokens are opaque strings that a server could in principle send to any registered token, so the relay adds one hardening rule beyond scoped keys: a key may deliver to a `(platform, token)` pair only through a binding of its own, created the first time that key sends to it.
+A send is `forbidden` and never reaches APNs or FCM when the token already has `RELAY_MAX_KEYS_PER_TOKEN` other keys bound.
+
+The design has to serve two cases at once.
+A phone signed in to several communities hands the same FCM or APNs token to each server, and each server sends with its own key, so several keys must be able to deliver to one token.
+A hostile server must still be unable to take a token away from a real one or to shut a real server out.
+
+- Bindings are per key. A binding is `(platform, token, key)`, so one key's binding never changes what another key may do, and a hostile server cannot hijack the token from a server that already sends to it. The first sender no longer owns the token.
+- The number of keys per token is capped (default 8). A key past the cap gets `forbidden`.
+- A full token admits a new key only by replacing a binding that has been unused for `RELAY_BINDING_IDLE_DAYS` (default 14), the idlest first. A hostile server that fills the slots therefore keeps real servers out only while every one of its keys keeps sending to the token, and every send of its own is still rate-limited per key.
+- A server that learned a token legitimately can always push junk to that device; the relay cannot prevent that and does not try. Revoking its key (`POST /admin/keys/{id}/revoke`) removes its bindings.
+- Bindings created before this change keep working: the tokens table is rebuilt on first start with the same rows, one per key.
+
+The home server reads the `forbidden` result, counts it, and shows the count in its admin push view, so a server that is silently shut out is visible.
 A token must be 1 to 1024 printable ASCII characters with no whitespace (the server already refuses to register a longer one), or it comes back as `error` and is never stored.
-A binding its owner has not sent to within `RELAY_TOKEN_RETENTION_DAYS` is pruned, so the tokens table - which, unlike the keys table, grows at a rate the caller controls with every send - stays bounded; a device token the provider has already reported dead is worthless to keep, and an actively used one is never at risk since every legitimate send resets its clock.
+A binding its key has not sent to within `RELAY_TOKEN_RETENTION_DAYS` is pruned, so the tokens table - which, unlike the keys table, grows at a rate the caller controls with every send - stays bounded; a device token the provider has already reported dead is worthless to keep, and an actively used one is never at risk since every legitimate send resets its clock.
 
 ## API
 
@@ -96,7 +106,9 @@ docker run -d \
 Put the relay behind whatever reverse proxy you already run (Caddy, Traefik, nginx).
 By default the relay ignores `X-Forwarded-For` entirely and keys per-IP rate limiting on the raw socket address, since every proxy the list above sets that header at *appends* its view of the peer - the leftmost entry is always whatever the client itself sent, and trusting it by default would let any caller spoof its way to an unlimited number of rate-limit identities.
 If you do run behind such a proxy and want registration limits keyed on the real client rather than the proxy's own address, set `RELAY_TRUST_PROXY=true`.
-The relay then reads the rightmost entry of `X-Forwarded-For`, the one hop the trusted proxy itself appended and the only one an external caller cannot forge.
+The relay then reads the client address from `X-Forwarded-For`, counting `RELAY_TRUST_PROXY_HOPS` entries from the right (default `1`, the rightmost entry the trusted proxy itself appended, which an external caller cannot forge).
+Behind Cloudflare plus another proxy set it to `2`, and so on; a header shorter than the hop count falls back to the socket address.
+Whichever way the address is found, an IPv6 address is keyed by its /64, because a single ordinary allocation holds 2^64 addresses a caller could rotate through; IPv4 stays per address.
 Enabling it without a real proxy in front that sets the header makes the limiter spoofable, so only turn it on once you have confirmed your proxy is the one setting `X-Forwarded-For`, not passing a client-supplied value through unchanged.
 The `/data` volume holds the SQLite key store; back it up, since losing it means every registered server re-registers on its next boot, and every device token re-establishes its binding to whichever server sends to it first.
 
@@ -113,7 +125,8 @@ The `/data` volume holds the SQLite key store; back it up, since losing it means
 | `RELAY_APNS_TEAM_ID` | *(empty)* | Apple Developer Team ID. |
 | `RELAY_APNS_BUNDLE_ID` | *(empty)* | App bundle id, used as the APNs background-wake topic. A `call` kind push is derived from it as `<bundle id>.voip`, so this one value configures both topics and they can never drift apart. |
 | `RELAY_APNS_PRODUCTION` | `true` | `true` for APNs' production gateway, `false` for the sandbox gateway. All four `RELAY_APNS_*` credential fields are required together; if any is empty, iOS sends fail clearly. |
-| `RELAY_TRUST_PROXY` | `false` | `true` reads the client IP from the rightmost entry of `X-Forwarded-For`, for use behind a reverse proxy that sets it. `false` (default) always uses the raw socket address. Enabling this without a real proxy in front makes per-IP rate limiting spoofable. |
+| `RELAY_TRUST_PROXY` | `false` | `true` reads the client IP from `X-Forwarded-For` (see `RELAY_TRUST_PROXY_HOPS`), for use behind a reverse proxy that sets it. `false` (default) always uses the raw socket address. Enabling this without a real proxy in front makes per-IP rate limiting spoofable. |
+| `RELAY_TRUST_PROXY_HOPS` | `1` | How many proxies are in front of the relay when `RELAY_TRUST_PROXY` is on: the client is the entry that many places from the right of `X-Forwarded-For`. |
 | `RELAY_REGISTER_PER_HOUR` | `5` | Per-IP registration rate. |
 | `RELAY_REGISTER_BURST` | `3` | Per-IP registration burst. |
 | `RELAY_MAX_REGISTRATIONS` | `10000` | Total keys the relay will ever mint, across every IP, forever (revoked keys still count against it). Zero or negative disables the ceiling. |
@@ -127,6 +140,8 @@ The `/data` volume holds the SQLite key store; back it up, since losing it means
 | `RELAY_SEND_CONCURRENCY` | `8` | Provider sends run at once, per `/v1/send` request, through a bounded worker pool. |
 | `RELAY_SEND_TIMEOUT_SECONDS` | `20` | Hard wall-clock deadline for one `/v1/send` request's provider dispatch. A message not yet attempted when it fires comes back as `not_attempted`. `0` or negative disables the deadline entirely rather than expiring it instantly. |
 | `RELAY_TOKEN_RETENTION_DAYS` | `90` | How long a device-token binding may go without its owning key sending to it before it is pruned. A send always refreshes the clock, so an actively used token is never at risk. `0` or negative disables pruning, leaving the tokens table to grow without bound. |
+| `RELAY_MAX_KEYS_PER_TOKEN` | `8` | How many keys may deliver to one device token. A key past it comes back as `forbidden`. `0` or negative disables the cap. |
+| `RELAY_BINDING_IDLE_DAYS` | `14` | How long a binding on a full token must be unused before a new key may replace it. `0` or negative never replaces. |
 | `RELAY_MAX_TOKENS_PER_KEY` | `20000` | How many device tokens one key may have bound. A new token past it comes back as `error`; one the key already owns keeps working. `0` or negative disables the cap. |
 
 ## Development

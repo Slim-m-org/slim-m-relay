@@ -68,6 +68,8 @@ func defaultCfg() config.Config {
 		MaxRegistrations:   1000000,
 		CallSendPerMinute:  100000,
 		CallSendBurst:      100000,
+		MaxKeysPerToken:    2,
+		BindingIdleDays:    14,
 	}
 }
 
@@ -365,37 +367,29 @@ func TestSendRejectsUnknownPlatformAndKind(t *testing.T) {
 	}
 }
 
-func TestSendEnforcesTokenBinding(t *testing.T) {
+func TestTwoServersDeliverToOneTokenAndAThirdIsRefused(t *testing.T) {
 	srv, ios, _, store := newTestServer(t, defaultCfg())
-	keyA, _ := store.Issue(context.Background(), "server-a", 0)
-	keyB, _ := store.Issue(context.Background(), "server-b", 0)
 	h := srv.Router()
-
-	// Server A claims the token first.
-	bodyA := `{"messages":[{"platform":"ios","token":"shared-token","kind":"wake","payload":"a"}]}`
-	rr := do(h, http.MethodPost, "/v1/send", bodyA, keyA)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("A's send = %d, want 200 (body %s)", rr.Code, rr.Body)
+	var plains []string
+	for _, label := range []string{"server-a", "server-b", "server-c"} {
+		k, _ := store.Issue(context.Background(), label, 0)
+		plains = append(plains, k)
 	}
-	var respA sendResp
-	_ = json.Unmarshal(rr.Body.Bytes(), &respA)
-	if len(respA.Results) != 1 || respA.Results[0].Status != push.StatusDelivered {
-		t.Fatalf("A's result = %+v, want delivered", respA.Results)
+	want := []push.Status{push.StatusDelivered, push.StatusDelivered, push.StatusForbidden}
+	for i, key := range plains {
+		body := `{"messages":[{"platform":"ios","token":"shared-token","kind":"wake","payload":"x"}]}`
+		rr := do(h, http.MethodPost, "/v1/send", body, key)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("send %d = %d, want 200 (body %s)", i, rr.Code, rr.Body)
+		}
+		var resp sendResp
+		_ = json.Unmarshal(rr.Body.Bytes(), &resp)
+		if len(resp.Results) != 1 || resp.Results[0].Status != want[i] {
+			t.Fatalf("send %d result = %+v, want %s", i, resp.Results, want[i])
+		}
 	}
-
-	// Server B tries to send to the same token: rejected, and never reaches the provider.
-	bodyB := `{"messages":[{"platform":"ios","token":"shared-token","kind":"wake","payload":"b"}]}`
-	rr = do(h, http.MethodPost, "/v1/send", bodyB, keyB)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("B's send = %d, want 200 (body %s)", rr.Code, rr.Body)
-	}
-	var respB sendResp
-	_ = json.Unmarshal(rr.Body.Bytes(), &respB)
-	if len(respB.Results) != 1 || respB.Results[0].Status != push.StatusForbidden {
-		t.Fatalf("B's result = %+v, want forbidden", respB.Results)
-	}
-	if len(ios.got) != 1 {
-		t.Errorf("provider saw %d messages, want exactly 1 (A's, not B's)", len(ios.got))
+	if len(ios.got) != 2 {
+		t.Errorf("provider saw %d messages, want 2 (the refused key never reaches it)", len(ios.got))
 	}
 }
 
