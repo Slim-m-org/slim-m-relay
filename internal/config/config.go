@@ -45,6 +45,9 @@ type Config struct {
 	// that sets X-Forwarded-For in front of the relay makes every IP-keyed limit trivially
 	// spoofable by any caller who sets the header itself.
 	TrustProxy bool
+	// TrustProxyHops is how many proxies sit in front of the relay when TrustProxy is on:
+	// the client address is the entry that many places from the right of X-Forwarded-For.
+	TrustProxyHops int
 
 	// RegisterPerHour and RegisterBurst bound how often one IP may mint new keys.
 	RegisterPerHour int
@@ -94,6 +97,13 @@ type Config struct {
 	// key cannot grow the store without bound. A real deployment binds roughly one token per
 	// device of its members. Zero or negative disables the cap.
 	MaxTokensPerKey int
+	// MaxKeysPerToken caps how many distinct keys may deliver to one device token, which is
+	// what lets a phone signed in to several servers receive pushes from each. A key past it
+	// gets `forbidden` unless a binding on that token has been idle for BindingIdleDays.
+	MaxKeysPerToken int
+	// BindingIdleDays is how long a binding on a full token must be unused before a new key
+	// may replace it.
+	BindingIdleDays int
 }
 
 // Load reads configuration from the environment, applying defaults that suit a single
@@ -113,6 +123,7 @@ func Load() (Config, error) {
 		APNsBundleID:       getenv("RELAY_APNS_BUNDLE_ID", ""),
 		APNsProduction:     p.bool("RELAY_APNS_PRODUCTION", true),
 		TrustProxy:         p.bool("RELAY_TRUST_PROXY", false),
+		TrustProxyHops:     p.int("RELAY_TRUST_PROXY_HOPS", 1),
 		RegisterPerHour:    p.int("RELAY_REGISTER_PER_HOUR", 5),
 		RegisterBurst:      p.int("RELAY_REGISTER_BURST", 3),
 		MaxRegistrations:   p.int("RELAY_MAX_REGISTRATIONS", 10000),
@@ -127,6 +138,8 @@ func Load() (Config, error) {
 		SendTimeoutSeconds: p.int("RELAY_SEND_TIMEOUT_SECONDS", 20),
 		TokenRetentionDays: p.int("RELAY_TOKEN_RETENTION_DAYS", 90),
 		MaxTokensPerKey:    p.int("RELAY_MAX_TOKENS_PER_KEY", 20000),
+		MaxKeysPerToken:    p.int("RELAY_MAX_KEYS_PER_TOKEN", 8),
+		BindingIdleDays:    p.int("RELAY_BINDING_IDLE_DAYS", 14),
 	}
 	return cfg, p.err
 }

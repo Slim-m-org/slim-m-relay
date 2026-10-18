@@ -145,18 +145,18 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 			results = append(results, push.Result{Token: m.Token, Status: push.StatusError})
 			continue
 		}
-		retention := time.Duration(s.cfg.TokenRetentionDays) * 24 * time.Hour
-		owner, err := s.keys.BindToken(r.Context(), k.ID, string(platform), m.Token, retention, s.cfg.MaxTokensPerKey)
-		if err != nil {
-			if !errors.Is(err, keys.ErrTokenLimit) {
-				log.Printf("relay: bind token: %v", err)
-			}
+		err := s.keys.BindToken(r.Context(), k.ID, string(platform), m.Token, s.bindLimits())
+		switch {
+		case errors.Is(err, keys.ErrTokenKeyLimit):
+			// Too many other servers already hold this token; refused like a stranger's.
+			results = append(results, push.Result{Token: m.Token, Status: push.StatusForbidden})
+			continue
+		case errors.Is(err, keys.ErrTokenLimit):
 			results = append(results, push.Result{Token: m.Token, Status: push.StatusError})
 			continue
-		}
-		if owner != k.ID {
-			// Harassment-hardening: this token belongs to a different registered server.
-			results = append(results, push.Result{Token: m.Token, Status: push.StatusForbidden})
+		case err != nil:
+			log.Printf("relay: bind token: %v", err)
+			results = append(results, push.Result{Token: m.Token, Status: push.StatusError})
 			continue
 		}
 
@@ -184,6 +184,17 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	log.Printf("relay: send key=%d n=%d delivered=%d unregistered=%d forbidden=%d not_attempted=%d error=%d",
 		k.ID, len(results), delivered, unregistered, forbidden, notAttempted, failed)
 	writeJSON(w, http.StatusOK, sendResp{Results: results})
+}
+
+// bindLimits is the token-binding policy from config.
+func (s *Server) bindLimits() keys.BindLimits {
+	day := 24 * time.Hour
+	return keys.BindLimits{
+		Retention:       time.Duration(s.cfg.TokenRetentionDays) * day,
+		MaxPerKey:       s.cfg.MaxTokensPerKey,
+		MaxKeysPerToken: s.cfg.MaxKeysPerToken,
+		BindingIdle:     time.Duration(s.cfg.BindingIdleDays) * day,
+	}
 }
 
 // dispatch drains items through a bounded worker pool (concurrency from config) under a

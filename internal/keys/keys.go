@@ -102,7 +102,7 @@ CREATE TABLE IF NOT EXISTS tokens (
 	key_id       INTEGER NOT NULL REFERENCES keys(id),
 	created_at   INTEGER NOT NULL,
 	last_seen_at INTEGER NOT NULL DEFAULT 0,
-	UNIQUE(platform, token)
+	UNIQUE(platform, token, key_id)
 );
 CREATE INDEX IF NOT EXISTS tokens_key_id ON tokens(key_id);`)
 	if err != nil {
@@ -128,7 +128,38 @@ CREATE INDEX IF NOT EXISTS tokens_key_id ON tokens(key_id);`)
 	case !strings.Contains(alterErr.Error(), "duplicate column name"):
 		return alterErr
 	}
-	return nil
+	return s.widenTokenUniqueness()
+}
+
+// widenTokenUniqueness rebuilds a tokens table created with UNIQUE(platform, token), which
+// let only one key hold a token, into one unique per (platform, token, key_id) so several
+// servers can share a device. Existing single-key bindings carry over unchanged.
+func (s *Store) widenTokenUniqueness() error {
+	var ddl string
+	if err := s.db.QueryRow(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tokens'`).Scan(&ddl); err != nil {
+		return err
+	}
+	if !strings.Contains(ddl, "UNIQUE(platform, token)") {
+		return nil
+	}
+	_, err := s.db.Exec(`
+BEGIN;
+CREATE TABLE tokens_wide (
+	id           INTEGER PRIMARY KEY AUTOINCREMENT,
+	platform     TEXT NOT NULL,
+	token        TEXT NOT NULL,
+	key_id       INTEGER NOT NULL REFERENCES keys(id),
+	created_at   INTEGER NOT NULL,
+	last_seen_at INTEGER NOT NULL DEFAULT 0,
+	UNIQUE(platform, token, key_id)
+);
+INSERT INTO tokens_wide (id, platform, token, key_id, created_at, last_seen_at)
+	SELECT id, platform, token, key_id, created_at, last_seen_at FROM tokens;
+DROP TABLE tokens;
+ALTER TABLE tokens_wide RENAME TO tokens;
+CREATE INDEX IF NOT EXISTS tokens_key_id ON tokens(key_id);
+COMMIT;`)
+	return err
 }
 
 // Issue mints a new key, stores only its hash, and returns the plaintext once. The
@@ -259,68 +290,101 @@ func (s *Store) Revoke(ctx context.Context, id int64) error {
 // ErrTokenLimit is returned by BindToken when a key already holds its maximum of bound tokens.
 var ErrTokenLimit = errors.New("keys: token limit reached")
 
+// ErrTokenKeyLimit is returned by BindToken when a token already has its maximum number of
+// distinct keys bound and none of them is idle enough to make room.
+var ErrTokenKeyLimit = errors.New("keys: token key limit reached")
+
+// BindLimits are the bounds BindToken applies. A zero or negative field disables that bound.
+type BindLimits struct {
+	// Retention is how long a binding may go untouched by its key before pruning may drop it.
+	Retention time.Duration
+	// MaxPerKey caps how many bindings one key may hold.
+	MaxPerKey int
+	// MaxKeysPerToken caps how many distinct keys may share one (platform, token).
+	MaxKeysPerToken int
+	// BindingIdle is how long a binding must be unused before a new key may take its slot
+	// on a token that is at MaxKeysPerToken.
+	BindingIdle time.Duration
+}
+
 // BindToken enforces harassment-hardening: a device push token is bound, per platform, to
-// whichever key first sends to it, and every later send for that token must come from the
-// same key. It returns the id of the key that owns the token - keyID itself on a fresh
-// binding, or the original owner if the token was already claimed by someone else - so the
-// caller can compare the two and reject a mismatch without a second round trip.
+// the keys that have sent to it, and a key may deliver to a token only through its own
+// binding. Several keys may share a token, because one phone signed in to several servers
+// hands the same token to each of them; a key never gains or loses anything by another
+// key's binding, so a hostile server cannot hijack the token from a real one. The number of
+// keys per token is capped, and a full token admits a new key only by replacing a binding
+// that has been idle for lim.BindingIdle, so a hostile server cannot fill the slots and keep
+// real servers out unless it keeps every one of its keys actively sending.
 //
-// maxPerKey caps how many bindings keyID may hold; a new token past it gets ErrTokenLimit
-// and a token the key already owns still succeeds. Zero or negative disables the cap.
+// It returns nil when keyID may deliver to the token. ErrTokenKeyLimit means the token is
+// full, ErrTokenLimit that keyID holds too many tokens.
 //
-// retention bounds how long a binding may go untouched by its owning key before it becomes
-// eligible for pruning (see maybePruneStaleTokens); zero or negative disables pruning. A
-// legitimate send from the owning key always refreshes the token's clock, so an actively
-// used token is never at risk regardless of how old the binding is.
+// A legitimate send from a key always refreshes its own binding's clock, so an actively used
+// token is never at risk of pruning.
 //
 // The read-then-write here is race-free because Open sets SetMaxOpenConns(1): the whole
 // relay shares one connection, so this transaction can never interleave with another.
-func (s *Store) BindToken(ctx context.Context, keyID int64, platform, token string, retention time.Duration, maxPerKey int) (int64, error) {
+func (s *Store) BindToken(ctx context.Context, keyID int64, platform, token string, lim BindLimits) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, err
+		return err
 	}
 	defer func() { _ = tx.Rollback() }()
 
 	now := time.Now().Unix()
-	var owner int64
-	err = tx.QueryRowContext(ctx,
-		`SELECT key_id FROM tokens WHERE platform = ? AND token = ?`, platform, token).Scan(&owner)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		if maxPerKey > 0 {
-			var bound int
-			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM tokens WHERE key_id = ?`, keyID).Scan(&bound); err != nil {
-				return 0, err
-			}
-			if bound >= maxPerKey {
-				return 0, ErrTokenLimit
-			}
-		}
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO tokens (platform, token, key_id, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?)`,
-			platform, token, keyID, now, now); err != nil {
-			return 0, err
-		}
-		owner = keyID
-	case err != nil:
-		return 0, err
-	default:
-		if owner == keyID {
-			// Only the owning key's own sends push the token's clock forward, so a different
-			// key merely naming a token it does not own - and being refused for it - can't keep
-			// an otherwise-abandoned binding alive forever.
-			if _, err := tx.ExecContext(ctx,
-				`UPDATE tokens SET last_seen_at = ? WHERE platform = ? AND token = ?`, now, platform, token); err != nil {
-				return 0, err
-			}
+	res, err := tx.ExecContext(ctx,
+		`UPDATE tokens SET last_seen_at = ? WHERE platform = ? AND token = ? AND key_id = ?`, now, platform, token, keyID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		if err := insertBinding(ctx, tx, keyID, platform, token, now, lim); err != nil {
+			return err
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return 0, err
+		return err
 	}
-	s.maybePruneStaleTokens(ctx, retention)
-	return owner, nil
+	s.maybePruneStaleTokens(ctx, lim.Retention)
+	return nil
+}
+
+func insertBinding(ctx context.Context, tx *sql.Tx, keyID int64, platform, token string, now int64, lim BindLimits) error {
+	if lim.MaxPerKey > 0 {
+		var bound int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM tokens WHERE key_id = ?`, keyID).Scan(&bound); err != nil {
+			return err
+		}
+		if bound >= lim.MaxPerKey {
+			return ErrTokenLimit
+		}
+	}
+	if lim.MaxKeysPerToken > 0 {
+		var holders int
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM tokens WHERE platform = ? AND token = ?`, platform, token).Scan(&holders); err != nil {
+			return err
+		}
+		if holders >= lim.MaxKeysPerToken {
+			if lim.BindingIdle <= 0 {
+				return ErrTokenKeyLimit
+			}
+			cutoff := now - int64(lim.BindingIdle.Seconds())
+			res, err := tx.ExecContext(ctx,
+				`DELETE FROM tokens WHERE id = (SELECT id FROM tokens WHERE platform = ? AND token = ? AND last_seen_at < ?
+				 ORDER BY last_seen_at LIMIT 1)`, platform, token, cutoff)
+			if err != nil {
+				return err
+			}
+			if n, _ := res.RowsAffected(); n == 0 {
+				return ErrTokenKeyLimit
+			}
+		}
+	}
+	_, err := tx.ExecContext(ctx,
+		`INSERT INTO tokens (platform, token, key_id, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?)`,
+		platform, token, keyID, now, now)
+	return err
 }
 
 // maybePruneStaleTokens opportunistically deletes token bindings nobody has sent to within

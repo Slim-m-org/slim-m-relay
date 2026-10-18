@@ -15,6 +15,9 @@ func TestLoadDefaults(t *testing.T) {
 	if c.Port != 8090 || c.DBPath != "/data/relay.db" {
 		t.Errorf("port/db = %d %q, want 8090 /data/relay.db", c.Port, c.DBPath)
 	}
+	if c.TrustProxyHops != 1 || c.MaxKeysPerToken != 8 || c.BindingIdleDays != 14 {
+		t.Errorf("defaults hops=%d keysPerToken=%d idleDays=%d, want 1, 8, 14", c.TrustProxyHops, c.MaxKeysPerToken, c.BindingIdleDays)
+	}
 	if c.TrustProxy {
 		t.Error("TrustProxy must default to false: trusting X-Forwarded-For without a proxy makes IP limits spoofable")
 	}
