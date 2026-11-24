@@ -6,7 +6,7 @@ name: push-relay-contract
 # maxPayloadBytes) is checked against the server's real, freshly generated
 # request too, not just against whatever fixture last happened to be
 # committed. See internal/api/push_relay_contract_test.go and slim-m's
-# crates/slimm-server/tests/push_relay_contract_fixture.rs.
+# crates/slimm-server/tests/it_notify/push_relay_contract_fixture.rs.
 on:
   push:
     branches: [main]
@@ -55,7 +55,7 @@ jobs:
 
       - name: generate the fixture from real slimm-server code
         working-directory: slim-m
-        run: cargo test -p slimm-server --test push_relay_contract_fixture
+        run: "cargo test -p slimm-server --test it_notify -- push_relay_contract_fixture::"
         env:
           SQLX_OFFLINE: "true"
           SLIMM_PUSH_CONTRACT_FIXTURE_OUT: ${{ github.workspace }}/internal/api/testdata/push_relay_contract.generated.json
