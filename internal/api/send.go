@@ -43,6 +43,7 @@ const maxPayloadBytes = 4096
 // caller's original order.
 type dispatchItem struct {
 	resultIdx int
+	platform  push.Platform
 	// token is the token exactly as the caller sent it, which is what its result must echo
 	// so the caller can prune by it; msg.Token is the canonical form that goes to the provider.
 	token  string
@@ -63,9 +64,9 @@ type pendingMessage struct {
 // handleSend forwards a batch of notifications to APNs or FCM, per message, on behalf of a
 // registered server. The caller authenticates with its registration key, is rate-limited
 // per key, and gets back one result per token so it can prune tokens the provider reports
-// as dead. Every device token is bound to whichever key first sends to it (see
-// internal/keys); a send for someone else's token is rejected rather than forwarded. The
-// relay never logs tokens or payload content - only counts and the key id.
+// as dead. Every device token is bound per key (see internal/keys): any key may bind a
+// token it knows, until MaxKeysPerToken keys hold it, so a token's secrecy is the only gate
+// on pushing to it. The relay never logs tokens or payload content - only counts and the key id.
 //
 // Because each provider does one HTTP round trip per token, dispatch runs the batch through
 // a bounded worker pool under a hard per-request deadline (both from config), so a large
@@ -74,7 +75,7 @@ type pendingMessage struct {
 // retries only those.
 func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	if !s.sendAdmitLim.Allow(s.clientIP(r)) {
-		writeRateLimited(w, s.sendAdmitLim, "rate limit exceeded")
+		writeRateLimited(w, s.sendAdmitLim, errRateLimited)
 		return
 	}
 	plain := bearerToken(r)
@@ -93,7 +94,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.sendLim.Allow(strconv.FormatInt(k.ID, 10)) {
-		writeRateLimited(w, s.sendLim, "rate limit exceeded")
+		writeRateLimited(w, s.sendLim, errRateLimited)
 		return
 	}
 
@@ -104,6 +105,11 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(req.Messages) > s.cfg.MaxMessages {
 		writeErr(w, http.StatusBadRequest, "too many messages in one request")
+		return
+	}
+
+	charged := countTokened(req.Messages)
+	if !s.chargeMessages(w, k.ID, charged) {
 		return
 	}
 
@@ -174,6 +180,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 			}
 			items = append(items, dispatchItem{
 				resultIdx: p.resultIdx,
+				platform:  p.platform,
 				token:     p.sent.Token,
 				sender:    sender,
 				msg:       push.Message{Token: p.token, Kind: p.kind, Payload: p.sent.Payload},
@@ -181,7 +188,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(bindErr, keys.ErrTokenKeyLimit):
 			// Too many other servers already hold this token; refused like a stranger's.
 			results[p.resultIdx] = push.Result{Token: p.sent.Token, Status: push.StatusForbidden}
-		case errors.Is(bindErr, keys.ErrTokenLimit):
+		case errors.Is(bindErr, keys.ErrTokenLimit), errors.Is(bindErr, keys.ErrRelayTokenLimit):
 			results[p.resultIdx] = push.Result{Token: p.sent.Token, Status: push.StatusRejected}
 		default:
 			results[p.resultIdx] = push.Result{Token: p.sent.Token, Status: push.StatusRetry}
@@ -189,17 +196,86 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.dispatch(ctx, items, results)
+	s.unbindDead(ctx, k.ID, items, results)
 	// A call-kind message that never got attempted before the deadline must not have
 	// permanently spent its slice of the tighter per-key call budget: the caller is told to
 	// retry a not_attempted message, and that retry must not be silently refused because an
 	// attempt that never happened already paid for it.
 	s.refundNotAttemptedCalls(k.ID, items, results)
+	s.refundMessages(k.ID, charged, items, results)
 
 	n := tally(results)
 	log.Printf("relay: send key=%d n=%d delivered=%d unregistered=%d forbidden=%d not_attempted=%d rejected=%d retry=%d",
 		k.ID, len(results), n[push.StatusDelivered], n[push.StatusUnregistered], n[push.StatusForbidden],
 		n[push.StatusNotAttempted], n[push.StatusRejected], n[push.StatusRetry])
 	writeJSON(w, http.StatusOK, sendResp{Results: results})
+}
+
+func countTokened(msgs []sendMessage) int {
+	n := 0
+	for _, m := range msgs {
+		if m.Token != "" {
+			n++
+		}
+	}
+	return n
+}
+
+// unbindDead drops the bindings of tokens a provider reported unregistered, so tokens that
+// never existed do not count against the relay-wide cap until the retention prune.
+func (s *Server) unbindDead(ctx context.Context, keyID int64, items []dispatchItem, results []push.Result) {
+	var dead []keys.TokenRef
+	for _, item := range items {
+		if results[item.resultIdx].Status == push.StatusUnregistered {
+			dead = append(dead, keys.TokenRef{Platform: string(item.platform), Token: item.msg.Token})
+		}
+	}
+	if err := s.keys.Unbind(context.WithoutCancel(ctx), keyID, dead); err != nil {
+		log.Printf("relay: unbind dead tokens: %v", err)
+	}
+}
+
+// chargeMessages spends n units of the key's per-message budget and of the relay-wide one,
+// answering 429 itself when either is empty. The relay-wide charge is returned if the key's
+// own budget refuses.
+func (s *Server) chargeMessages(w http.ResponseWriter, keyID int64, n int) bool {
+	if n == 0 {
+		return true
+	}
+	id := strconv.FormatInt(keyID, 10)
+	if s.msgLim != nil && !s.msgLim.AllowN(id, n) {
+		writeRateLimitedN(w, s.msgLim, id, n, errRateLimited)
+		return false
+	}
+	if s.providerLim != nil && !s.providerLim.AllowN(providerBudgetKey, n) {
+		if s.msgLim != nil {
+			s.msgLim.ReturnN(id, n)
+		}
+		writeRateLimitedN(w, s.providerLim, providerBudgetKey, n, "relay is busy, retry later")
+		return false
+	}
+	return true
+}
+
+// providerBudgetKey is the single bucket the relay-wide budget draws from.
+const providerBudgetKey = "relay"
+
+// refundMessages gives back the units of every message that never reached a provider: invalid
+// ones, refused bindings and anything the deadline cut, so only attempted sends stay charged.
+func (s *Server) refundMessages(keyID int64, charged int, items []dispatchItem, results []push.Result) {
+	attempted := 0
+	for _, item := range items {
+		if results[item.resultIdx].Status != push.StatusNotAttempted {
+			attempted++
+		}
+	}
+	unused := charged - attempted
+	if s.msgLim != nil {
+		s.msgLim.ReturnN(strconv.FormatInt(keyID, 10), unused)
+	}
+	if s.providerLim != nil {
+		s.providerLim.ReturnN(providerBudgetKey, unused)
+	}
 }
 
 // sendContext bounds one request's token binding and provider dispatch by the configured
@@ -218,6 +294,7 @@ func (s *Server) bindLimits() keys.BindLimits {
 	return keys.BindLimits{
 		Retention:       time.Duration(s.cfg.TokenRetentionDays) * day,
 		MaxPerKey:       s.cfg.MaxTokensPerKey,
+		MaxTotal:        s.cfg.MaxTokensTotal,
 		MaxKeysPerToken: s.cfg.MaxKeysPerToken,
 		BindingIdle:     time.Duration(s.cfg.BindingIdleDays) * day,
 	}
@@ -231,16 +308,11 @@ func (s *Server) bindLimits() keys.BindLimits {
 // rather than as a zero value, so the caller can tell "never tried" apart from every real
 // outcome and retry only those.
 //
-// Once the deadline fires, the feed loop below stops handing out new work, but a worker
-// already partway through an item's Send call is always let finish and report its real
-// outcome rather than being raced against the same deadline and abandoned - a message whose
-// turn already came deserves a real answer, not a coin-flip between that and not_attempted.
-// This is safe specifically because every Sender this dispatches to must itself honour ctx:
-// APNs' client and FCM's HTTP send already do via http.NewRequestWithContext, and FCM's
-// oauth2 token fetch - the one call in this codebase that used to be uncancellable, since
-// oauth2.TokenSource.Token() takes no context of its own - is now bounded by ctx too (see
-// fcm's tokenGate). So "already started" only ever means "already respecting ctx.Done()",
-// and finishing it takes microseconds past the deadline, not indefinitely.
+// Once the deadline fires, the feed loop stops handing out new work and a worker skips any
+// item it picked up too late. Every Sender honours ctx (APNs and FCM through
+// http.NewRequestWithContext, FCM's token fetch through its gate), so a send in flight at the
+// deadline is cut and returns promptly. A send that comes back retry after the deadline never
+// got a provider answer, so it is reported as not_attempted like an item that was never sent.
 func (s *Server) dispatch(ctx context.Context, items []dispatchItem, results []push.Result) {
 	if len(items) == 0 {
 		return
@@ -265,10 +337,17 @@ func (s *Server) dispatch(ctx context.Context, items []dispatchItem, results []p
 			defer wg.Done()
 			for idx := range work {
 				item := items[idx]
+				if ctx.Err() != nil {
+					results[item.resultIdx] = push.Result{Token: item.token, Status: push.StatusNotAttempted}
+					continue
+				}
 				out := item.sender.Send(ctx, []push.Message{item.msg})
 				status := push.StatusRetry
 				if len(out) > 0 {
 					status = out[0].Status
+				}
+				if status == push.StatusRetry && ctx.Err() != nil {
+					status = push.StatusNotAttempted
 				}
 				results[item.resultIdx] = push.Result{Token: item.token, Status: status}
 			}

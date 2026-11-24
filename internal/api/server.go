@@ -6,8 +6,11 @@
 package api
 
 import (
+	"context"
 	"log"
 	"net/http"
+	"sync"
+	"time"
 
 	"github.com/nc1107/slim-m-relay/internal/config"
 	"github.com/nc1107/slim-m-relay/internal/keys"
@@ -31,6 +34,11 @@ type Server struct {
 	// a call rings a device, making it the most abusable kind - on top of sendLim's general
 	// per-key fan-out budget.
 	callLim *ratelimit.Limiter
+	// msgLim charges one unit per message to the sending key, and providerLim one unit per
+	// message across every key; either is nil when its budget is disabled.
+	msgLim      *ratelimit.Limiter
+	providerLim *ratelimit.Limiter
+	health      healthCache
 	// adminLim is IP-keyed and charged only for admin requests that fail authentication.
 	adminLim *ratelimit.Limiter
 }
@@ -39,7 +47,7 @@ type Server struct {
 // by each message's declared platform; either may be a push.Unconfigured stub when the
 // relay was started without that platform's credentials.
 func New(cfg config.Config, ios, android push.Sender, store *keys.Store) *Server {
-	return &Server{
+	srv := &Server{
 		cfg:          cfg,
 		ios:          ios,
 		android:      android,
@@ -49,7 +57,19 @@ func New(cfg config.Config, ios, android push.Sender, store *keys.Store) *Server
 		sendLim:      ratelimit.New(float64(cfg.SendPerMinute), cfg.SendBurst),
 		callLim:      ratelimit.New(float64(cfg.CallSendPerMinute), cfg.CallSendBurst),
 		adminLim:     ratelimit.New(adminFailuresPerMinute, adminFailureBurst),
+		msgLim:       optionalLimiter(cfg.SendMessagesPerMinute, cfg.SendMessagesBurst),
+		providerLim:  optionalLimiter(cfg.ProviderCallsPerMinute, cfg.ProviderCallsBurst),
 	}
+	srv.health.ping = store.Ping
+	return srv
+}
+
+// optionalLimiter is nil unless both numbers are positive, so a zero value means no budget.
+func optionalLimiter(perMinute, burst int) *ratelimit.Limiter {
+	if perMinute <= 0 || burst <= 0 {
+		return nil
+	}
+	return ratelimit.New(float64(perMinute), burst)
 }
 
 // Router builds the HTTP handler. Routing uses net/http's method+path patterns (Go 1.22+),
@@ -69,10 +89,38 @@ func (s *Server) Router() http.Handler {
 	return recoverer(mux)
 }
 
+// healthTTL is how long a health answer is reused, so a flood of probes costs the single
+// database connection one query per interval instead of one per request.
+const healthTTL = 2 * time.Second
+
+type healthCache struct {
+	mu    sync.Mutex
+	ping  func(context.Context) error
+	err   error
+	until time.Time
+}
+
+// healthPingTimeout bounds one ping, which runs detached from the caller that triggered it.
+const healthPingTimeout = 3 * time.Second
+
+func (h *healthCache) check(ctx context.Context) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if now := time.Now(); now.Before(h.until) {
+		return h.err
+	}
+	// Detached, so one prober hanging up cannot cache a cancellation as the answer for everyone.
+	pingCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), healthPingTimeout)
+	defer cancel()
+	h.err = h.ping(pingCtx)
+	h.until = time.Now().Add(healthTTL)
+	return h.err
+}
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	// A static ok kept reading green while the key store was unreadable and every
 	// register and verify failed; asking the database is what makes this a health check.
-	if err := s.keys.Ping(r.Context()); err != nil {
+	if err := s.health.check(r.Context()); err != nil {
 		log.Printf("relay: health: key store unreachable: %v", err)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "degraded"})
 		return

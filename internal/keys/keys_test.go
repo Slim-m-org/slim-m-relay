@@ -76,8 +76,8 @@ func TestIssueEnforcesRegistrationCeiling(t *testing.T) {
 	if err := s.Revoke(ctx, k.ID); err != nil {
 		t.Fatalf("revoke: %v", err)
 	}
-	if _, err := s.Issue(ctx, "fourth", 2); err != ErrRegistrationCeiling {
-		t.Fatalf("issue after revoking one: got %v, want ErrRegistrationCeiling (the ceiling counts keys ever minted)", err)
+	if _, err := s.Issue(ctx, "fourth", 2); err != nil {
+		t.Fatalf("issue after revoking one: got %v, want the revoked key's slot freed", err)
 	}
 }
 
@@ -444,7 +444,7 @@ func TestBindTokenRefusesARevokedKeyAndLeavesNoBinding(t *testing.T) {
 	}
 }
 
-func TestPurgeUnusedRemovesOnlyOldKeysThatNeverSentAndReopensTheirSlots(t *testing.T) {
+func TestPurgeUnusedRemovesOnlyOldKeysThatNeverBoundATokenAndReopensTheirSlots(t *testing.T) {
 	s := openTemp(t)
 	ctx := context.Background()
 	const max = 4
@@ -460,14 +460,12 @@ func TestPurgeUnusedRemovesOnlyOldKeysThatNeverSentAndReopensTheirSlots(t *testi
 	if err := s.Revoke(ctx, revoked.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.db.Exec(`UPDATE keys SET last_used_at = NULL WHERE id = ?`, revoked.ID); err != nil {
-		t.Fatal(err)
-	}
 	old := time.Now().Add(-48 * time.Hour).Unix()
 	if _, err := s.db.Exec(`UPDATE keys SET created_at = ? WHERE label != 'fresh'`, old); err != nil {
 		t.Fatal(err)
 	}
 
+	bindOK(t, s, used.ID, "ios", "t0", BindLimits{})
 	n, err := s.PurgeUnused(ctx, 24*time.Hour)
 	if err != nil || n != 2 {
 		t.Fatalf("purged %d (%v), want the squatter and the revoked never-used key", n, err)
@@ -483,27 +481,6 @@ func TestPurgeUnusedRemovesOnlyOldKeysThatNeverSentAndReopensTheirSlots(t *testi
 	bindOK(t, s, used.ID, "ios", "t1", BindLimits{})
 	if _, err := s.Issue(ctx, "reopened", max); err != nil {
 		t.Errorf("a purge should reopen registration slots: %v", err)
-	}
-}
-
-func TestPurgeUnusedDropsTheBindingsOfThePurgedKeys(t *testing.T) {
-	s := openTemp(t)
-	ctx := context.Background()
-	plain, _ := s.Issue(ctx, "", 0)
-	k, _ := s.Verify(ctx, plain)
-	if _, err := s.db.Exec(`UPDATE keys SET last_used_at = NULL, created_at = 1 WHERE id = ?`, k.ID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.db.Exec(
-		`INSERT INTO tokens (platform, token, key_id, created_at, last_seen_at) VALUES ('ios', 't', ?, 1, 1)`, k.ID); err != nil {
-		t.Fatal(err)
-	}
-	if n, err := s.PurgeUnused(ctx, time.Hour); err != nil || n != 1 {
-		t.Fatalf("purged %d (%v), want 1", n, err)
-	}
-	var rows int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM tokens`).Scan(&rows); err != nil || rows != 0 {
-		t.Fatalf("tokens left = %d (%v), want 0", rows, err)
 	}
 }
 

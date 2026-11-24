@@ -30,7 +30,7 @@ func (s *Server) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		if !s.adminLim.Allow(s.clientIP(r)) {
-			writeRateLimited(w, s.adminLim, "rate limit exceeded")
+			writeRateLimited(w, s.adminLim, errRateLimited)
 			return
 		}
 		writeErr(w, http.StatusUnauthorized, "unauthorized")
@@ -73,7 +73,7 @@ func (s *Server) handleAdminRevokeKey(w http.ResponseWriter, r *http.Request) {
 // maxPurgeAgeDays keeps the age in days from overflowing a time.Duration.
 const maxPurgeAgeDays = 36500
 
-// handleAdminPurgeUnused deletes keys that never sent and are older than older_than_days,
+// handleAdminPurgeUnused deletes keys that never bound a device token and are older than older_than_days,
 // freeing registration slots squatted by keys nobody uses. The age is required and at least
 // a day, so a call can never wipe keys a server has only just been given.
 func (s *Server) handleAdminPurgeUnused(w http.ResponseWriter, r *http.Request) {
@@ -88,6 +88,6 @@ func (s *Server) handleAdminPurgeUnused(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, http.StatusInternalServerError, "server error")
 		return
 	}
-	log.Printf("relay: purged %d keys never used and older than %d days", n, days)
+	log.Printf("relay: purged %d keys with no bound token and older than %d days", n, days)
 	writeJSON(w, http.StatusOK, map[string]int64{"purged": n})
 }

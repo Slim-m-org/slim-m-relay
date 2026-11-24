@@ -40,7 +40,7 @@ Rate limiting is per-instance and in-process: it lives in the relay's own memory
 Each limiter tracks at most 200000 client addresses or keys; when all of those are in use, new ones share a single bucket until idle ones age out, so a flood of rotating addresses cannot grow the relay's memory without bound.
 A misbehaving server can be cut off with `POST /admin/keys/{id}/revoke`.
 Revoking a key also drops its device-token bindings.
-Keys that registered but never sent anything can be cleared with `POST /admin/keys/purge-unused`, which frees their registration slots if someone squats the ceiling.
+Keys that registered but never bound a device token can be cleared with `POST /admin/keys/purge-unused`, which frees their registration slots if someone squats the ceiling; revoking a key frees its slot too.
 It is deliberately manual: a slim-m server whose key is purged gets `401` from every send until it is given a new one, so choose an age that no real server is still waiting inside.
 
 ### Token-to-key binding
@@ -73,7 +73,7 @@ A binding its key has not sent to within `RELAY_TOKEN_RETENTION_DAYS` is pruned,
 | `GET` | `/healthz` | none | Liveness. |
 | `GET` | `/admin/keys` | `Authorization: Bearer <admin token>` | List issued keys (metadata only). |
 | `POST` | `/admin/keys/{id}/revoke` | `Authorization: Bearer <admin token>` | Revoke a key. |
-| `POST` | `/admin/keys/purge-unused?older_than_days=N` | `Authorization: Bearer <admin token>` | Delete keys that never sent anything and were issued more than `N` days ago (`N` is required and at least 1). Returns `{"purged": n}`. |
+| `POST` | `/admin/keys/purge-unused?older_than_days=N` | `Authorization: Bearer <admin token>` | Delete keys that never bound a device token and were issued more than `N` days ago (`N` is required and at least 1). Returns `{"purged": n}`. |
 
 Admin endpoints are only mounted when `RELAY_ADMIN_TOKEN` is set to at least 32 characters; a shorter token leaves them disabled and the relay says so at startup.
 Generate one with `openssl rand -hex 32`.
@@ -158,7 +158,7 @@ The `/data` volume holds the SQLite key store; back it up, since losing it means
 | `RELAY_TRUST_PROXY_HOPS` | `1` | How many proxies are in front of the relay when `RELAY_TRUST_PROXY` is on: the client is the entry that many places from the right of `X-Forwarded-For`. |
 | `RELAY_REGISTER_PER_HOUR` | `5` | Per-IP registration rate. |
 | `RELAY_REGISTER_BURST` | `3` | Per-IP registration burst. |
-| `RELAY_MAX_REGISTRATIONS` | `10000` | Total keys the relay will hold, across every IP (revoked keys still count against it). Only `POST /admin/keys/purge-unused` gives slots back. The relay logs when 80% is used and again at the ceiling. Zero or negative disables the ceiling. |
+| `RELAY_MAX_REGISTRATIONS` | `10000` | Total keys the relay will hold, across every IP (revoked keys do not count, so revoking or purging gives slots back). The relay logs when 80% is used and again at the ceiling. Zero or negative disables the ceiling. |
 | `RELAY_SEND_ADMIT_PER_MINUTE` | `600` | Per-IP admission rate on `/v1/send`, checked before the bearer key is looked up so unauthenticated garbage never reaches the key store. Sized well above any honest server's send rate. |
 | `RELAY_SEND_ADMIT_BURST` | `120` | Per-IP admission burst on `/v1/send`. |
 | `RELAY_SEND_PER_MINUTE` | `120` | Per-key send rate. |
@@ -171,6 +171,11 @@ The `/data` volume holds the SQLite key store; back it up, since losing it means
 | `RELAY_TOKEN_RETENTION_DAYS` | `90` | How long a device-token binding may go without its owning key sending to it before it is pruned. A send always refreshes the clock, so an actively used token is never at risk. `0` or negative disables pruning, leaving the tokens table to grow without bound. |
 | `RELAY_MAX_KEYS_PER_TOKEN` | `8` | How many keys may deliver to one device token. A key past it comes back as `forbidden`. `0` or negative disables the cap. |
 | `RELAY_BINDING_IDLE_DAYS` | `14` | How long a binding on a full token must be unused before a new key may replace it. `0` or negative never replaces. |
+| `RELAY_SEND_MESSAGES_PER_MINUTE` | `6000` | Per-key send budget, charged per message. A request over it gets `429`. |
+| `RELAY_SEND_MESSAGES_BURST` | `2000` | Per-key message burst. |
+| `RELAY_PROVIDER_CALLS_PER_MINUTE` | `60000` | Relay-wide message budget across every key, kept under the FCM project quota. `0` or negative disables it. |
+| `RELAY_PROVIDER_CALLS_BURST` | `5000` | Relay-wide message burst. |
+| `RELAY_MAX_TOKENS_TOTAL` | `500000` | How many device tokens the whole relay may have bound. A new token past it comes back as `rejected`. `0` or negative disables the cap. |
 | `RELAY_MAX_TOKENS_PER_KEY` | `20000` | How many device tokens one key may have bound. A new token past it comes back as `rejected`; one the key already owns keeps working. `0` or negative disables the cap. |
 
 The relay refuses to start when a per-minute or per-hour rate, a burst, or `RELAY_MAX_MESSAGES` is below 1, or when `RELAY_TRUST_PROXY_HOPS` is below 1 with `RELAY_TRUST_PROXY` on, and the error names the variable.
