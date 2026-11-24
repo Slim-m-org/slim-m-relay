@@ -63,9 +63,9 @@ type pendingMessage struct {
 // handleSend forwards a batch of notifications to APNs or FCM, per message, on behalf of a
 // registered server. The caller authenticates with its registration key, is rate-limited
 // per key, and gets back one result per token so it can prune tokens the provider reports
-// as dead. Every device token is bound to whichever key first sends to it (see
-// internal/keys); a send for someone else's token is rejected rather than forwarded. The
-// relay never logs tokens or payload content - only counts and the key id.
+// as dead. Every device token is bound per key (see internal/keys): any key may bind a
+// token it knows, until MaxKeysPerToken keys hold it, so a token's secrecy is the only gate
+// on pushing to it. The relay never logs tokens or payload content - only counts and the key id.
 //
 // Because each provider does one HTTP round trip per token, dispatch runs the batch through
 // a bounded worker pool under a hard per-request deadline (both from config), so a large
@@ -104,6 +104,11 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(req.Messages) > s.cfg.MaxMessages {
 		writeErr(w, http.StatusBadRequest, "too many messages in one request")
+		return
+	}
+
+	charged := countTokened(req.Messages)
+	if !s.chargeMessages(w, k.ID, charged) {
 		return
 	}
 
@@ -181,7 +186,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(bindErr, keys.ErrTokenKeyLimit):
 			// Too many other servers already hold this token; refused like a stranger's.
 			results[p.resultIdx] = push.Result{Token: p.sent.Token, Status: push.StatusForbidden}
-		case errors.Is(bindErr, keys.ErrTokenLimit):
+		case errors.Is(bindErr, keys.ErrTokenLimit), errors.Is(bindErr, keys.ErrRelayTokenLimit):
 			results[p.resultIdx] = push.Result{Token: p.sent.Token, Status: push.StatusRejected}
 		default:
 			results[p.resultIdx] = push.Result{Token: p.sent.Token, Status: push.StatusRetry}
@@ -194,12 +199,66 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	// retry a not_attempted message, and that retry must not be silently refused because an
 	// attempt that never happened already paid for it.
 	s.refundNotAttemptedCalls(k.ID, items, results)
+	s.refundMessages(k.ID, charged, items, results)
 
 	n := tally(results)
 	log.Printf("relay: send key=%d n=%d delivered=%d unregistered=%d forbidden=%d not_attempted=%d rejected=%d retry=%d",
 		k.ID, len(results), n[push.StatusDelivered], n[push.StatusUnregistered], n[push.StatusForbidden],
 		n[push.StatusNotAttempted], n[push.StatusRejected], n[push.StatusRetry])
 	writeJSON(w, http.StatusOK, sendResp{Results: results})
+}
+
+func countTokened(msgs []sendMessage) int {
+	n := 0
+	for _, m := range msgs {
+		if m.Token != "" {
+			n++
+		}
+	}
+	return n
+}
+
+// chargeMessages spends n units of the key's per-message budget and of the relay-wide one,
+// answering 429 itself when either is empty. The relay-wide charge is returned if the key's
+// own budget refuses.
+func (s *Server) chargeMessages(w http.ResponseWriter, keyID int64, n int) bool {
+	if n == 0 {
+		return true
+	}
+	id := strconv.FormatInt(keyID, 10)
+	if s.msgLim != nil && !s.msgLim.AllowN(id, n) {
+		writeRateLimited(w, s.msgLim, "rate limit exceeded")
+		return false
+	}
+	if s.providerLim != nil && !s.providerLim.AllowN(providerBudgetKey, n) {
+		if s.msgLim != nil {
+			s.msgLim.ReturnN(id, n)
+		}
+		writeRateLimited(w, s.providerLim, "relay is busy, retry later")
+		return false
+	}
+	return true
+}
+
+// providerBudgetKey is the single bucket the relay-wide budget draws from.
+const providerBudgetKey = "relay"
+
+// refundMessages gives back the units of every message that never reached a provider: invalid
+// ones, refused bindings and anything the deadline cut, so only attempted sends stay charged.
+func (s *Server) refundMessages(keyID int64, charged int, items []dispatchItem, results []push.Result) {
+	attempted := 0
+	for _, item := range items {
+		if results[item.resultIdx].Status != push.StatusNotAttempted {
+			attempted++
+		}
+	}
+	unused := charged - attempted
+	if s.msgLim != nil {
+		s.msgLim.ReturnN(strconv.FormatInt(keyID, 10), unused)
+	}
+	if s.providerLim != nil {
+		s.providerLim.ReturnN(providerBudgetKey, unused)
+	}
 }
 
 // sendContext bounds one request's token binding and provider dispatch by the configured
@@ -218,6 +277,7 @@ func (s *Server) bindLimits() keys.BindLimits {
 	return keys.BindLimits{
 		Retention:       time.Duration(s.cfg.TokenRetentionDays) * day,
 		MaxPerKey:       s.cfg.MaxTokensPerKey,
+		MaxTotal:        s.cfg.MaxTokensTotal,
 		MaxKeysPerToken: s.cfg.MaxKeysPerToken,
 		BindingIdle:     time.Duration(s.cfg.BindingIdleDays) * day,
 	}

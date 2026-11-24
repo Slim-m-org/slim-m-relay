@@ -75,12 +75,20 @@ func (l *Limiter) RetryAfter() time.Duration {
 }
 
 // Allow reports whether an action for key may proceed, consuming one token if so.
-func (l *Limiter) Allow(key string) bool {
+func (l *Limiter) Allow(key string) bool { return l.AllowN(key, 1) }
+
+// AllowN consumes n tokens for key, all or nothing. A cost above the burst is clamped to it,
+// so an oversized request is charged the whole bucket rather than refused forever.
+func (l *Limiter) AllowN(key string, n int) bool {
+	cost := math.Min(float64(n), l.burst)
+	if cost < 1 {
+		cost = 1
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := time.Now()
 	l.evictIdle(now)
-	b, fresh := l.bucketFor(key, now)
+	b, fresh := l.bucketFor(key, now, cost)
 	if fresh {
 		return true
 	}
@@ -89,8 +97,8 @@ func (l *Limiter) Allow(key string) bool {
 		b.tokens = l.burst
 	}
 	b.last = now
-	if b.tokens >= 1 {
-		b.tokens--
+	if b.tokens >= cost {
+		b.tokens -= cost
 		return true
 	}
 	return false
@@ -99,8 +107,9 @@ func (l *Limiter) Allow(key string) bool {
 // bucketFor returns key's bucket, moved to the front of the usage order. A key seen for the
 // first time gets a bucket with its first token already spent and fresh set, so the caller
 // allows it without refilling. When the map is full of buckets that are all still in use, the
-// key falls back to the shared overflow bucket instead of adding an entry.
-func (l *Limiter) bucketFor(key string, now time.Time) (b *bucket, fresh bool) {
+// key falls back to the shared overflow bucket instead of adding an entry. cost is what the
+// first call spends from a new bucket.
+func (l *Limiter) bucketFor(key string, now time.Time, cost float64) (b *bucket, fresh bool) {
 	if el, ok := l.buckets[key]; ok {
 		l.order.MoveToFront(el)
 		return el.Value.(*bucket), false
@@ -111,7 +120,7 @@ func (l *Limiter) bucketFor(key string, now time.Time) (b *bucket, fresh bool) {
 		}
 		return l.overflow, false
 	}
-	b = &bucket{key: key, tokens: l.burst - 1, last: now}
+	b = &bucket{key: key, tokens: l.burst - cost, last: now}
 	l.buckets[key] = l.order.PushFront(b)
 	return b, true
 }
@@ -120,7 +129,13 @@ func (l *Limiter) bucketFor(key string, now time.Time) (b *bucket, fresh bool) {
 // be needed - for example a message that consumed a tighter per-key budget (like the call
 // kind's) but was then never attempted before the request's deadline fired. It is a no-op
 // for a key with no bucket yet, since that means Allow was never called for it.
-func (l *Limiter) Return(key string) {
+func (l *Limiter) Return(key string) { l.ReturnN(key, 1) }
+
+// ReturnN gives back n tokens, undoing an AllowN whose work was not all done.
+func (l *Limiter) ReturnN(key string, n int) {
+	if n <= 0 {
+		return
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	el, ok := l.buckets[key]
@@ -128,7 +143,7 @@ func (l *Limiter) Return(key string) {
 		return
 	}
 	b := el.Value.(*bucket)
-	b.tokens++
+	b.tokens += float64(n)
 	if b.tokens > l.burst {
 		b.tokens = l.burst
 	}

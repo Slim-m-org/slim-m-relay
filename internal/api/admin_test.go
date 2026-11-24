@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"github.com/nc1107/slim-m-relay/internal/keys"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -195,7 +196,11 @@ func TestAdminPurgeUnusedReportsHowManyKeysItRemoved(t *testing.T) {
 		}
 	}
 	used, _ := rig.store.Issue(ctx, "active", 0)
-	if _, err := rig.store.Verify(ctx, used); err != nil {
+	usedKey, err := rig.store.Verify(ctx, used)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rig.store.BindTokens(ctx, usedKey.ID, []keys.TokenRef{{Platform: "ios", Token: "t1"}}, keys.BindLimits{}); err != nil {
 		t.Fatal(err)
 	}
 	h := rig.srv.Router()
