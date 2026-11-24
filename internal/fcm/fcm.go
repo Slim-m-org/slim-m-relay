@@ -83,6 +83,9 @@ func (s *Sender) Send(ctx context.Context, msgs []push.Message) []push.Result {
 	results := make([]push.Result, len(msgs))
 	tok, err := s.gate.token(ctx, s.tokens)
 	if err != nil {
+		if ctx.Err() == nil {
+			push.LogOncePerRequest(ctx, "fcm-token", "relay: fcm could not mint an access token: %v", err)
+		}
 		for i, m := range msgs {
 			results[i] = push.Result{Token: m.Token, Status: push.StatusRetry}
 		}

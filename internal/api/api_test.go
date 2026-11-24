@@ -525,6 +525,60 @@ func TestRefundNotAttemptedCallsReturnsTheToken(t *testing.T) {
 	}
 }
 
+// A send the deadline cuts off before any provider answer, and an item fed after the
+// deadline, are both never-confirmed: not_attempted, and a call's budget comes back.
+func TestDeadlineCutSendsAreNotAttemptedAndRefunded(t *testing.T) {
+	store, err := keys.Open(filepath.Join(t.TempDir(), "relay.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	cfg := defaultCfg()
+	cfg.SendConcurrency = 1
+	cfg.CallSendPerMinute = 1
+	cfg.CallSendBurst = 1
+	sender := &slowSender{delay: time.Second}
+	srv := New(cfg, sender, sender, store)
+	const keyID = int64(1)
+	if !srv.callLim.Allow(strconv.FormatInt(keyID, 10)) {
+		t.Fatal("setup: first call budget Allow should succeed")
+	}
+	items := []dispatchItem{{resultIdx: 0, token: "call-1", sender: sender, msg: push.Message{Token: "call-1", Kind: push.KindCall, Payload: "c"}}}
+	results := make([]push.Result, len(items))
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	srv.dispatch(ctx, items, results)
+	if results[0].Status != push.StatusNotAttempted {
+		t.Fatalf("in-flight cut result = %+v, want not_attempted", results[0])
+	}
+	srv.refundNotAttemptedCalls(keyID, items, results)
+	if !srv.callLim.Allow(strconv.FormatInt(keyID, 10)) {
+		t.Error("call budget was not refunded for the cut send")
+	}
+}
+
+// An item picked up by a worker after the deadline must not reach the sender at all.
+func TestDispatchDoesNotSendAfterTheDeadline(t *testing.T) {
+	cfg := defaultCfg()
+	srv, _, _, _ := newTestServer(t, cfg)
+	sender := &fakeSender{}
+	items := []dispatchItem{{resultIdx: 0, token: "a", sender: sender, msg: push.Message{Token: "a", Kind: push.KindWake, Payload: "c"}}}
+	results := make([]push.Result, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for i := 0; i < 50; i++ {
+		results[0] = push.Result{}
+		srv.dispatch(ctx, items, results)
+		if results[0].Status != push.StatusNotAttempted {
+			t.Fatalf("result = %+v, want not_attempted", results[0])
+		}
+	}
+	if len(sender.got) != 0 {
+		t.Errorf("sender was called %d times after the deadline, want 0", len(sender.got))
+	}
+}
+
 func TestSendRateLimitedPerKey(t *testing.T) {
 	cfg := defaultCfg()
 	cfg.SendBurst = 1
@@ -604,12 +658,9 @@ func TestDispatchMarksUnattemptedAsNotAttempted(t *testing.T) {
 	defer cancel()
 	srv.dispatch(ctx, items, results)
 
-	if results[0].Status == push.StatusNotAttempted || results[0].Status == "" {
-		t.Errorf("result[0] = %+v, want a real attempted outcome (the sole worker's first pick)", results[0])
-	}
-	for i := 1; i < len(results); i++ {
+	for i := range results {
 		if results[i].Status != push.StatusNotAttempted {
-			t.Errorf("result[%d] = %+v, want not_attempted (never reached before the deadline)", i, results[i])
+			t.Errorf("result[%d] = %+v, want not_attempted (never answered before the deadline)", i, results[i])
 		}
 		if results[i].Token != items[i].token {
 			t.Errorf("result[%d].Token = %q, want %q", i, results[i].Token, items[i].token)

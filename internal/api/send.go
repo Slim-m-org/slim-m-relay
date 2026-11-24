@@ -308,16 +308,11 @@ func (s *Server) bindLimits() keys.BindLimits {
 // rather than as a zero value, so the caller can tell "never tried" apart from every real
 // outcome and retry only those.
 //
-// Once the deadline fires, the feed loop below stops handing out new work, but a worker
-// already partway through an item's Send call is always let finish and report its real
-// outcome rather than being raced against the same deadline and abandoned - a message whose
-// turn already came deserves a real answer, not a coin-flip between that and not_attempted.
-// This is safe specifically because every Sender this dispatches to must itself honour ctx:
-// APNs' client and FCM's HTTP send already do via http.NewRequestWithContext, and FCM's
-// oauth2 token fetch - the one call in this codebase that used to be uncancellable, since
-// oauth2.TokenSource.Token() takes no context of its own - is now bounded by ctx too (see
-// fcm's tokenGate). So "already started" only ever means "already respecting ctx.Done()",
-// and finishing it takes microseconds past the deadline, not indefinitely.
+// Once the deadline fires, the feed loop stops handing out new work and a worker skips any
+// item it picked up too late. Every Sender honours ctx (APNs and FCM through
+// http.NewRequestWithContext, FCM's token fetch through its gate), so a send in flight at the
+// deadline is cut and returns promptly. A send that comes back retry after the deadline never
+// got a provider answer, so it is reported as not_attempted like an item that was never sent.
 func (s *Server) dispatch(ctx context.Context, items []dispatchItem, results []push.Result) {
 	if len(items) == 0 {
 		return
@@ -342,10 +337,17 @@ func (s *Server) dispatch(ctx context.Context, items []dispatchItem, results []p
 			defer wg.Done()
 			for idx := range work {
 				item := items[idx]
+				if ctx.Err() != nil {
+					results[item.resultIdx] = push.Result{Token: item.token, Status: push.StatusNotAttempted}
+					continue
+				}
 				out := item.sender.Send(ctx, []push.Message{item.msg})
 				status := push.StatusRetry
 				if len(out) > 0 {
 					status = out[0].Status
+				}
+				if status == push.StatusRetry && ctx.Err() != nil {
+					status = push.StatusNotAttempted
 				}
 				results[item.resultIdx] = push.Result{Token: item.token, Status: status}
 			}

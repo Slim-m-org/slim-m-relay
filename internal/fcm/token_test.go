@@ -159,3 +159,41 @@ func TestSendClassifiesProviderTroubleAsRetry(t *testing.T) {
 		}
 	}
 }
+
+// A dead service account makes every token fetch fail; the operator needs one line naming it.
+func TestTokenFetchFailureLogsOncePerRequest(t *testing.T) {
+	var buf bytes.Buffer
+	orig := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(orig) })
+
+	s := testSender("http://127.0.0.1:0")
+	s.tokens = &countingSource{err: errors.New("invalid_grant")}
+	ctx := push.WithRequestScope(context.Background())
+	for i := 0; i < 50; i++ {
+		res := s.Send(ctx, []push.Message{{Token: "tok", Kind: push.KindWake, Payload: "c"}})
+		if res[0].Status != push.StatusRetry {
+			t.Fatalf("status = %s, want retry", res[0].Status)
+		}
+	}
+	if got := strings.Count(buf.String(), "could not mint an access token"); got != 1 {
+		t.Errorf("logged %d token-failure lines for one request, want 1 (log: %q)", got, buf.String())
+	}
+}
+
+// A cancelled request is the caller's deadline, not a credential fault, so it stays silent.
+func TestTokenFetchCancelledByDeadlineIsNotLogged(t *testing.T) {
+	var buf bytes.Buffer
+	orig := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(orig) })
+
+	s := testSender("http://127.0.0.1:0")
+	s.tokens = &countingSource{err: errors.New("invalid_grant")}
+	ctx, cancel := context.WithCancel(push.WithRequestScope(context.Background()))
+	cancel()
+	s.Send(ctx, []push.Message{{Token: "tok", Kind: push.KindWake, Payload: "c"}})
+	if strings.Contains(buf.String(), "access token") {
+		t.Errorf("logged a token failure for a cancelled request: %q", buf.String())
+	}
+}
