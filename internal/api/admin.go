@@ -30,7 +30,7 @@ func (s *Server) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		if !s.adminLim.Allow(s.clientIP(r)) {
-			writeRateLimited(w, s.adminLim, "rate limit exceeded")
+			writeRateLimited(w, s.adminLim, errRateLimited)
 			return
 		}
 		writeErr(w, http.StatusUnauthorized, "unauthorized")

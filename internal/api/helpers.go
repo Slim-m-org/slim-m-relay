@@ -155,3 +155,5 @@ func tally(results []push.Result) map[push.Status]int {
 	}
 	return counts
 }
+
+const errRateLimited = "rate limit exceeded"

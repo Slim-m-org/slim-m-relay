@@ -32,9 +32,9 @@ func TestPurgeUnusedRemovesKeysThatOnlyAuthenticated(t *testing.T) {
 	s := openTemp(t)
 	ctx := context.Background()
 	squat, _ := s.Issue(ctx, "squatter", 0)
-	real, _ := s.Issue(ctx, "real", 0)
+	genuine, _ := s.Issue(ctx, "genuine", 0)
 	sk, _ := s.Verify(ctx, squat)
-	rk, _ := s.Verify(ctx, real)
+	rk, _ := s.Verify(ctx, genuine)
 	if _, err := s.BindTokens(ctx, sk.ID, nil, BindLimits{}); err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +51,7 @@ func TestPurgeUnusedRemovesKeysThatOnlyAuthenticated(t *testing.T) {
 	if _, err := s.Verify(ctx, squat); !errors.Is(err, ErrNotFound) {
 		t.Errorf("squatting key survived the purge: %v", err)
 	}
-	if _, err := s.Verify(ctx, real); err != nil {
+	if _, err := s.Verify(ctx, genuine); err != nil {
 		t.Errorf("key with a bound token was purged: %v", err)
 	}
 }

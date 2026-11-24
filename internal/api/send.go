@@ -75,7 +75,7 @@ type pendingMessage struct {
 // retries only those.
 func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	if !s.sendAdmitLim.Allow(s.clientIP(r)) {
-		writeRateLimited(w, s.sendAdmitLim, "rate limit exceeded")
+		writeRateLimited(w, s.sendAdmitLim, errRateLimited)
 		return
 	}
 	plain := bearerToken(r)
@@ -94,7 +94,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.sendLim.Allow(strconv.FormatInt(k.ID, 10)) {
-		writeRateLimited(w, s.sendLim, "rate limit exceeded")
+		writeRateLimited(w, s.sendLim, errRateLimited)
 		return
 	}
 
@@ -244,7 +244,7 @@ func (s *Server) chargeMessages(w http.ResponseWriter, keyID int64, n int) bool 
 	}
 	id := strconv.FormatInt(keyID, 10)
 	if s.msgLim != nil && !s.msgLim.AllowN(id, n) {
-		writeRateLimitedN(w, s.msgLim, id, n, "rate limit exceeded")
+		writeRateLimitedN(w, s.msgLim, id, n, errRateLimited)
 		return false
 	}
 	if s.providerLim != nil && !s.providerLim.AllowN(providerBudgetKey, n) {

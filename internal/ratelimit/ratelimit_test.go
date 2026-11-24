@@ -241,3 +241,89 @@ func TestRetryAfterIsTheTimeOneTokenTakesToRefill(t *testing.T) {
 		}
 	}
 }
+
+func TestRetryAfterNNeverWaitsOnALimiterThatDoesNotRefill(t *testing.T) {
+	l := New(0, 2)
+	l.AllowN("k", 2)
+	if got := l.RetryAfterN("k", 2); got != 0 {
+		t.Errorf("RetryAfterN on a non-refilling limiter = %v, want 0", got)
+	}
+}
+
+func TestRetryAfterNIsZeroForAKeyWithNoBucketOrEnoughTokens(t *testing.T) {
+	l := New(60, 10)
+	if got := l.RetryAfterN("unseen", 5); got != 0 {
+		t.Errorf("RetryAfterN for an unseen key = %v, want 0", got)
+	}
+	l.AllowN("k", 2)
+	if got := l.RetryAfterN("k", 5); got != 0 {
+		t.Errorf("RetryAfterN with 8 of 10 tokens left and a cost of 5 = %v, want 0", got)
+	}
+}
+
+func TestRetryAfterNCoversTheWholeShortfall(t *testing.T) {
+	l := New(60, 10) // one token a second
+	if !l.AllowN("k", 10) {
+		t.Fatal("a full bucket should allow its whole burst")
+	}
+	if got := l.RetryAfterN("k", 5); got != 5*time.Second {
+		t.Errorf("RetryAfterN(5) from empty = %v, want 5s", got)
+	}
+	if got := l.RetryAfterN("k", 1); got != time.Second {
+		t.Errorf("RetryAfterN(1) from empty = %v, want 1s", got)
+	}
+}
+
+func TestRetryAfterNClampsACostAboveTheBurstAndBelowOne(t *testing.T) {
+	l := New(60, 4)
+	l.AllowN("k", 4)
+	if got := l.RetryAfterN("k", 100); got != 4*time.Second {
+		t.Errorf("RetryAfterN(100) = %v, want 4s: the cost clamps to the burst", got)
+	}
+	if got := l.RetryAfterN("k", 0); got != time.Second {
+		t.Errorf("RetryAfterN(0) = %v, want 1s: a zero cost is charged as one", got)
+	}
+}
+
+func TestAllowNChargesAtLeastOneToken(t *testing.T) {
+	l := New(0, 2)
+	if !l.AllowN("k", 0) || !l.AllowN("k", -3) {
+		t.Fatal("the first two charges should fit the burst")
+	}
+	if l.AllowN("k", 0) {
+		t.Error("a zero cost must still spend one token, so a third charge is refused")
+	}
+}
+
+func TestReturnNGivesTokensBackUpToTheBurst(t *testing.T) {
+	l := New(0, 5)
+	l.AllowN("k", 5)
+	l.ReturnN("k", 3)
+	if !l.AllowN("k", 3) {
+		t.Error("3 returned tokens should be spendable")
+	}
+	if l.Allow("k") {
+		t.Error("only the 3 returned tokens should have come back")
+	}
+	l.ReturnN("k", 100)
+	if !l.AllowN("k", 5) {
+		t.Error("returning more than the burst should refill to the burst")
+	}
+	if l.Allow("k") {
+		t.Error("a return must never lift the bucket above the burst")
+	}
+}
+
+func TestReturnNIgnoresNonPositiveCountsAndUnknownKeys(t *testing.T) {
+	l := New(0, 2)
+	l.AllowN("k", 2)
+	l.ReturnN("k", 0)
+	l.ReturnN("k", -4)
+	if l.Allow("k") {
+		t.Error("a non-positive return must not give tokens back")
+	}
+	l.ReturnN("never-seen", 5)
+	if got := bucketCount(l); got != 1 {
+		t.Errorf("buckets = %d, want 1: returning to an unseen key must not create one", got)
+	}
+}
