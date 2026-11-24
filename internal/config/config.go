@@ -69,8 +69,8 @@ type Config struct {
 	// RegisterPerHour and RegisterBurst bound how often one IP may mint new keys.
 	RegisterPerHour int
 	RegisterBurst   int
-	// MaxRegistrations is the total number of keys the relay will ever mint, across every IP
-	// and forever (revoked keys still count), so /v1/register cannot be used to grow the key
+	// MaxRegistrations is the total number of live keys the relay holds, across every IP
+	// (a revoked key frees its slot), so /v1/register cannot be used to grow the key
 	// table without bound. Zero or negative disables the ceiling.
 	MaxRegistrations int
 	// SendAdmitPerMinute and SendAdmitBurst bound how often one IP may reach /v1/send at
@@ -88,6 +88,15 @@ type Config struct {
 	// it gets its own ceiling under the general SendPerMinute/SendBurst budget.
 	CallSendPerMinute int
 	CallSendBurst     int
+	// SendMessagesPerMinute and SendMessagesBurst bound how many messages one key may have
+	// dispatched, charged per message rather than per request, since every message is a
+	// provider call on credentials all deployments share.
+	SendMessagesPerMinute int
+	SendMessagesBurst     int
+	// ProviderCallsPerMinute and ProviderCallsBurst are the relay-wide budget on messages
+	// across every key, kept under the FCM project quota. Zero or negative disables it.
+	ProviderCallsPerMinute int
+	ProviderCallsBurst     int
 	// MaxMessages caps how many device tokens a single /v1/send request may carry.
 	MaxMessages int
 	// SendConcurrency bounds how many provider sends run at once for one /v1/send request,
@@ -114,6 +123,9 @@ type Config struct {
 	// key cannot grow the store without bound. A real deployment binds roughly one token per
 	// device of its members. Zero or negative disables the cap.
 	MaxTokensPerKey int
+	// MaxTokensTotal caps token bindings across the whole relay; a new binding past it comes
+	// back as rejected. Zero or negative disables the cap.
+	MaxTokensTotal int
 	// MaxKeysPerToken caps how many distinct keys may deliver to one device token, which is
 	// what lets a phone signed in to several servers receive pushes from each. A key past it
 	// gets `forbidden` unless a binding on that token has been idle for BindingIdleDays.
@@ -130,33 +142,38 @@ type Config struct {
 func Load() (Config, error) {
 	p := &parser{}
 	cfg := Config{
-		Port:               p.int("RELAY_PORT", 8090),
-		DBPath:             getenv("RELAY_DB_PATH", "/data/relay.db"),
-		AdminToken:         getenv("RELAY_ADMIN_TOKEN", ""),
-		FCMCredentialsFile: getenv("RELAY_FCM_CREDENTIALS_FILE", ""),
-		APNsKeyPath:        getenv("RELAY_APNS_KEY_PATH", ""),
-		APNsKeyID:          getenv("RELAY_APNS_KEY_ID", ""),
-		APNsTeamID:         getenv("RELAY_APNS_TEAM_ID", ""),
-		APNsBundleID:       getenv("RELAY_APNS_BUNDLE_ID", ""),
-		APNsProduction:     p.bool("RELAY_APNS_PRODUCTION", true),
-		TrustProxy:         p.bool("RELAY_TRUST_PROXY", false),
-		TrustProxyHops:     p.int("RELAY_TRUST_PROXY_HOPS", 1),
-		RegisterPerHour:    p.int("RELAY_REGISTER_PER_HOUR", 5),
-		RegisterBurst:      p.int("RELAY_REGISTER_BURST", 3),
-		MaxRegistrations:   p.int("RELAY_MAX_REGISTRATIONS", 10000),
-		SendAdmitPerMinute: p.int("RELAY_SEND_ADMIT_PER_MINUTE", 600),
-		SendAdmitBurst:     p.int("RELAY_SEND_ADMIT_BURST", 120),
-		SendPerMinute:      p.int("RELAY_SEND_PER_MINUTE", 120),
-		SendBurst:          p.int("RELAY_SEND_BURST", 60),
-		CallSendPerMinute:  p.int("RELAY_CALL_SEND_PER_MINUTE", 10),
-		CallSendBurst:      p.int("RELAY_CALL_SEND_BURST", 5),
-		MaxMessages:        p.int("RELAY_MAX_MESSAGES", 500),
-		SendConcurrency:    p.int("RELAY_SEND_CONCURRENCY", 8),
-		SendTimeoutSeconds: p.int("RELAY_SEND_TIMEOUT_SECONDS", DefaultSendTimeoutSeconds),
-		TokenRetentionDays: p.int("RELAY_TOKEN_RETENTION_DAYS", 90),
-		MaxTokensPerKey:    p.int("RELAY_MAX_TOKENS_PER_KEY", 20000),
-		MaxKeysPerToken:    p.int("RELAY_MAX_KEYS_PER_TOKEN", 8),
-		BindingIdleDays:    p.int("RELAY_BINDING_IDLE_DAYS", 14),
+		Port:                   p.int("RELAY_PORT", 8090),
+		DBPath:                 getenv("RELAY_DB_PATH", "/data/relay.db"),
+		AdminToken:             getenv("RELAY_ADMIN_TOKEN", ""),
+		FCMCredentialsFile:     getenv("RELAY_FCM_CREDENTIALS_FILE", ""),
+		APNsKeyPath:            getenv("RELAY_APNS_KEY_PATH", ""),
+		APNsKeyID:              getenv("RELAY_APNS_KEY_ID", ""),
+		APNsTeamID:             getenv("RELAY_APNS_TEAM_ID", ""),
+		APNsBundleID:           getenv("RELAY_APNS_BUNDLE_ID", ""),
+		APNsProduction:         p.bool("RELAY_APNS_PRODUCTION", true),
+		TrustProxy:             p.bool("RELAY_TRUST_PROXY", false),
+		TrustProxyHops:         p.int("RELAY_TRUST_PROXY_HOPS", 1),
+		RegisterPerHour:        p.int("RELAY_REGISTER_PER_HOUR", 5),
+		RegisterBurst:          p.int("RELAY_REGISTER_BURST", 3),
+		MaxRegistrations:       p.int("RELAY_MAX_REGISTRATIONS", 10000),
+		SendAdmitPerMinute:     p.int("RELAY_SEND_ADMIT_PER_MINUTE", 600),
+		SendAdmitBurst:         p.int("RELAY_SEND_ADMIT_BURST", 120),
+		SendPerMinute:          p.int("RELAY_SEND_PER_MINUTE", 120),
+		SendBurst:              p.int("RELAY_SEND_BURST", 60),
+		CallSendPerMinute:      p.int("RELAY_CALL_SEND_PER_MINUTE", 10),
+		CallSendBurst:          p.int("RELAY_CALL_SEND_BURST", 5),
+		SendMessagesPerMinute:  p.int("RELAY_SEND_MESSAGES_PER_MINUTE", 6000),
+		SendMessagesBurst:      p.int("RELAY_SEND_MESSAGES_BURST", 2000),
+		ProviderCallsPerMinute: p.int("RELAY_PROVIDER_CALLS_PER_MINUTE", 60000),
+		ProviderCallsBurst:     p.int("RELAY_PROVIDER_CALLS_BURST", 5000),
+		MaxTokensTotal:         p.int("RELAY_MAX_TOKENS_TOTAL", 500000),
+		MaxMessages:            p.int("RELAY_MAX_MESSAGES", 500),
+		SendConcurrency:        p.int("RELAY_SEND_CONCURRENCY", 8),
+		SendTimeoutSeconds:     p.int("RELAY_SEND_TIMEOUT_SECONDS", DefaultSendTimeoutSeconds),
+		TokenRetentionDays:     p.int("RELAY_TOKEN_RETENTION_DAYS", 90),
+		MaxTokensPerKey:        p.int("RELAY_MAX_TOKENS_PER_KEY", 20000),
+		MaxKeysPerToken:        p.int("RELAY_MAX_KEYS_PER_TOKEN", 8),
+		BindingIdleDays:        p.int("RELAY_BINDING_IDLE_DAYS", 14),
 	}
 	return cfg, p.err
 }

@@ -5,6 +5,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -164,5 +165,32 @@ func TestSendBatchRefusesOneFullTokenAndDeliversTheRest(t *testing.T) {
 	}
 	if _, err := rig.store.Verify(context.Background(), other); err != nil {
 		t.Fatalf("key unexpectedly unusable: %v", err)
+	}
+}
+
+func TestSendRetryAfterCoversTheWholeShortfallOfABatch(t *testing.T) {
+	cfg := defaultCfg()
+	cfg.SendMessagesBurst = 10
+	cfg.SendMessagesPerMinute = 60
+	srv, _, _, store := newTestServer(t, cfg)
+	key, _ := store.Issue(context.Background(), "", 0)
+	batch := func(n int) string {
+		msgs := make([]string, n)
+		for i := range msgs {
+			msgs[i] = fmt.Sprintf(`{"platform":"ios","token":"%064x","kind":"wake","payload":"c"}`, i+1)
+		}
+		return `{"messages":[` + strings.Join(msgs, ",") + `]}`
+	}
+
+	if rr := do(srv.Router(), http.MethodPost, "/v1/send", batch(10), key); rr.Code != http.StatusOK {
+		t.Fatalf("first batch = %d, want 200", rr.Code)
+	}
+	rr := do(srv.Router(), http.MethodPost, "/v1/send", batch(5), key)
+
+	if rr.Code != http.StatusTooManyRequests {
+		t.Fatalf("second batch = %d, want 429", rr.Code)
+	}
+	if got := rr.Header().Get("Retry-After"); got != "5" {
+		t.Errorf("Retry-After = %q, want 5: five messages at one a second", got)
 	}
 }

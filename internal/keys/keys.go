@@ -128,7 +128,19 @@ CREATE INDEX IF NOT EXISTS tokens_key_id ON tokens(key_id);`)
 	case !strings.Contains(alterErr.Error(), "duplicate column name"):
 		return alterErr
 	}
+	if err := s.addLastBoundAt(); err != nil {
+		return err
+	}
 	return s.widenTokenUniqueness()
+}
+
+// addLastBoundAt adds the stamp PurgeUnused reads; a duplicate-column error means it exists.
+func (s *Store) addLastBoundAt() error {
+	_, err := s.db.Exec(`ALTER TABLE keys ADD COLUMN last_bound_at INTEGER`)
+	if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		return err
+	}
+	return nil
 }
 
 // widenTokenUniqueness rebuilds a tokens table created with UNIQUE(platform, token), which
@@ -164,11 +176,10 @@ COMMIT;`)
 
 // Issue mints a new key, stores only its hash, and returns the plaintext once. The
 // plaintext is unrecoverable afterward. label is an unverified admin hint (the claimed
-// public URL). max bounds the total number of keys this store will ever issue - including
-// revoked ones, since revoking a key does not reopen the slot it used - so /v1/register
-// cannot grow the key table without bound; zero or negative disables the ceiling. Returns
-// ErrRegistrationCeiling once max is reached. Only PurgeUnused reopens slots, and logs when
-// the count crosses 80% of max and again when it reaches max.
+// public URL). max bounds the number of live keys, so revoking a key reopens its slot and
+// /v1/register cannot grow the live key set without bound; zero or negative disables the
+// ceiling. Returns ErrRegistrationCeiling once max is reached. The store logs when the count
+// crosses 80% of max and again when it reaches max.
 //
 // The count-then-insert runs in one transaction, race-free for the same reason BindToken is
 // (see Open): the whole relay shares one connection, so a second Issue call blocks until
@@ -188,7 +199,7 @@ func (s *Store) Issue(ctx context.Context, label string, max int64) (string, err
 
 	var count int64
 	if max > 0 {
-		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM keys`).Scan(&count); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM keys WHERE revoked_at IS NULL`).Scan(&count); err != nil {
 			return "", err
 		}
 		if count >= max {
@@ -314,38 +325,29 @@ func (s *Store) Revoke(ctx context.Context, id int64) error {
 	return tx.Commit()
 }
 
-// PurgeUnused deletes keys that have never sent anything and were issued more than olderThan
-// ago, revoked or not, and returns how many it removed. It is the only way a registration
-// slot is given back, so squatted keys cannot hold the ceiling forever. Key ids are never
-// reused, so a purged key cannot come back as someone else's.
+// PurgeUnused deletes keys that hold no bound token, were issued more than olderThan ago and
+// have not bound one within that window, revoked or not, and returns how many it removed. A
+// key that only ever authenticated or sent empty batches counts as unused, so squatted keys
+// cannot hold the ceiling by touching last_used_at, while a key that really sent survives
+// having all its tokens pruned. Key ids are never reused, so a purged key cannot come back
+// as someone else's.
 func (s *Store) PurgeUnused(ctx context.Context, olderThan time.Duration) (int64, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, err
-	}
-	defer func() { _ = tx.Rollback() }()
-
 	cutoff := time.Now().Add(-olderThan).Unix()
-	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM tokens WHERE key_id IN (SELECT id FROM keys WHERE last_used_at IS NULL AND created_at < ?)`, cutoff); err != nil {
-		return 0, err
-	}
-	res, err := tx.ExecContext(ctx, `DELETE FROM keys WHERE last_used_at IS NULL AND created_at < ?`, cutoff)
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM keys WHERE created_at < ? AND (last_bound_at IS NULL OR last_bound_at < ?)
+		 AND NOT EXISTS (SELECT 1 FROM tokens WHERE tokens.key_id = keys.id)`, cutoff, cutoff)
 	if err != nil {
 		return 0, err
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return 0, err
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, err
-	}
-	return n, nil
+	return res.RowsAffected()
 }
 
 // ErrTokenLimit is returned by BindTokens when a key already holds its maximum of bound tokens.
 var ErrTokenLimit = errors.New("keys: token limit reached")
+
+// ErrRelayTokenLimit is returned by BindTokens when the relay as a whole holds its maximum
+// of bound tokens, whichever keys hold them.
+var ErrRelayTokenLimit = errors.New("keys: relay token limit reached")
 
 // ErrTokenKeyLimit is returned by BindTokens when a token already has its maximum number of
 // distinct keys bound and none of them is idle enough to make room.
@@ -357,6 +359,8 @@ type BindLimits struct {
 	Retention time.Duration
 	// MaxPerKey caps how many bindings one key may hold.
 	MaxPerKey int
+	// MaxTotal caps how many bindings the whole relay may hold.
+	MaxTotal int
 	// MaxKeysPerToken caps how many distinct keys may share one (platform, token).
 	MaxKeysPerToken int
 	// BindingIdle is how long a binding must be unused before a new key may take its slot
@@ -377,6 +381,26 @@ func (s *Store) BindToken(ctx context.Context, keyID int64, platform, token stri
 		return err
 	}
 	return errs[0]
+}
+
+// Unbind removes keyID's bindings for refs, for tokens the provider reported dead, so fake
+// tokens cannot pile up toward the relay-wide cap. Other keys' bindings are never touched.
+func (s *Store) Unbind(ctx context.Context, keyID int64, refs []TokenRef) error {
+	if len(refs) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, ref := range refs {
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM tokens WHERE platform = ? AND token = ? AND key_id = ?`, ref.Platform, ref.Token, keyID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // BindTokens enforces harassment-hardening for a whole batch in one transaction: a device
@@ -418,9 +442,18 @@ func (s *Store) BindTokens(ctx context.Context, keyID int64, refs []TokenRef, li
 	}
 
 	now := time.Now().Unix()
+	if len(refs) > 0 {
+		_, err = tx.ExecContext(ctx,
+			`UPDATE keys SET last_bound_at = ? WHERE id = ? AND (last_bound_at IS NULL OR last_bound_at < ?)`,
+			now, keyID, now-int64(stampInterval.Seconds()))
+		if err != nil {
+			return nil, err
+		}
+	}
 	outcomes := make([]error, len(refs))
+	counts := &bindCounts{}
 	for i, ref := range refs {
-		outcomes[i], err = bindOne(ctx, tx, keyID, ref, now, lim)
+		outcomes[i], err = bindOne(ctx, tx, keyID, ref, now, lim, counts)
 		if err != nil {
 			return nil, err
 		}
@@ -434,15 +467,15 @@ func (s *Store) BindTokens(ctx context.Context, keyID int64, refs []TokenRef, li
 
 // bindOne refreshes or creates one binding. The first return is the refusal for this token
 // alone, the second a failure that must abandon the whole transaction.
-func bindOne(ctx context.Context, tx *sql.Tx, keyID int64, ref TokenRef, now int64, lim BindLimits) (refusal, fatal error) {
+func bindOne(ctx context.Context, tx *sql.Tx, keyID int64, ref TokenRef, now int64, lim BindLimits, counts *bindCounts) (refusal, fatal error) {
 	var seen int64
 	err := tx.QueryRowContext(ctx,
 		`SELECT last_seen_at FROM tokens WHERE platform = ? AND token = ? AND key_id = ?`,
 		ref.Platform, ref.Token, keyID).Scan(&seen)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		err = insertBinding(ctx, tx, keyID, ref, now, lim)
-		if errors.Is(err, ErrTokenLimit) || errors.Is(err, ErrTokenKeyLimit) {
+		err = insertBinding(ctx, tx, keyID, ref, now, lim, counts)
+		if errors.Is(err, ErrTokenLimit) || errors.Is(err, ErrRelayTokenLimit) || errors.Is(err, ErrTokenKeyLimit) {
 			return err, nil
 		}
 		return nil, err
@@ -457,16 +490,42 @@ func bindOne(ctx context.Context, tx *sql.Tx, keyID int64, ref TokenRef, now int
 	return nil, err
 }
 
-func insertBinding(ctx context.Context, tx *sql.Tx, keyID int64, ref TokenRef, now int64, lim BindLimits) error {
-	platform, token := ref.Platform, ref.Token
+// bindCounts caches, for one BindTokens transaction, how many bindings the key and the whole
+// relay hold, so a batch of new tokens runs one COUNT each instead of one per token. The
+// single connection means nothing else writes between the read and the batch's own inserts.
+type bindCounts struct {
+	loaded     bool
+	key, total int
+}
+
+func (c *bindCounts) load(ctx context.Context, tx *sql.Tx, keyID int64, lim BindLimits) error {
+	if c.loaded {
+		return nil
+	}
 	if lim.MaxPerKey > 0 {
-		var bound int
-		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM tokens WHERE key_id = ?`, keyID).Scan(&bound); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM tokens WHERE key_id = ?`, keyID).Scan(&c.key); err != nil {
 			return err
 		}
-		if bound >= lim.MaxPerKey {
-			return ErrTokenLimit
+	}
+	if lim.MaxTotal > 0 {
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM tokens`).Scan(&c.total); err != nil {
+			return err
 		}
+	}
+	c.loaded = true
+	return nil
+}
+
+func insertBinding(ctx context.Context, tx *sql.Tx, keyID int64, ref TokenRef, now int64, lim BindLimits, counts *bindCounts) error {
+	platform, token := ref.Platform, ref.Token
+	if err := counts.load(ctx, tx, keyID, lim); err != nil {
+		return err
+	}
+	if lim.MaxPerKey > 0 && counts.key >= lim.MaxPerKey {
+		return ErrTokenLimit
+	}
+	if lim.MaxTotal > 0 && counts.total >= lim.MaxTotal {
+		return ErrRelayTokenLimit
 	}
 	if lim.MaxKeysPerToken > 0 {
 		var holders int
@@ -488,12 +547,17 @@ func insertBinding(ctx context.Context, tx *sql.Tx, keyID int64, ref TokenRef, n
 			if n, _ := res.RowsAffected(); n == 0 {
 				return ErrTokenKeyLimit
 			}
+			counts.total--
 		}
 	}
-	_, err := tx.ExecContext(ctx,
+	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO tokens (platform, token, key_id, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?)`,
-		platform, token, keyID, now, now)
-	return err
+		platform, token, keyID, now, now); err != nil {
+		return err
+	}
+	counts.key++
+	counts.total++
+	return nil
 }
 
 // maybePruneStaleTokens opportunistically deletes token bindings nobody has sent to within

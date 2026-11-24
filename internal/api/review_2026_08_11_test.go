@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // A caller with no bearer at all must meet the admission limit before anything
@@ -81,6 +82,7 @@ func TestHealthzReportsDegradedOnceTheStoreIsGone(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatalf("close store: %v", err)
 	}
+	srv.health.until = time.Time{}
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil))
 	if rec.Code != http.StatusServiceUnavailable {
