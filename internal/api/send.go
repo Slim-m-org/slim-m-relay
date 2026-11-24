@@ -43,6 +43,7 @@ const maxPayloadBytes = 4096
 // caller's original order.
 type dispatchItem struct {
 	resultIdx int
+	platform  push.Platform
 	// token is the token exactly as the caller sent it, which is what its result must echo
 	// so the caller can prune by it; msg.Token is the canonical form that goes to the provider.
 	token  string
@@ -179,6 +180,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 			}
 			items = append(items, dispatchItem{
 				resultIdx: p.resultIdx,
+				platform:  p.platform,
 				token:     p.sent.Token,
 				sender:    sender,
 				msg:       push.Message{Token: p.token, Kind: p.kind, Payload: p.sent.Payload},
@@ -194,6 +196,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.dispatch(ctx, items, results)
+	s.unbindDead(ctx, k.ID, items, results)
 	// A call-kind message that never got attempted before the deadline must not have
 	// permanently spent its slice of the tighter per-key call budget: the caller is told to
 	// retry a not_attempted message, and that retry must not be silently refused because an
@@ -218,6 +221,20 @@ func countTokened(msgs []sendMessage) int {
 	return n
 }
 
+// unbindDead drops the bindings of tokens a provider reported unregistered, so tokens that
+// never existed do not count against the relay-wide cap until the retention prune.
+func (s *Server) unbindDead(ctx context.Context, keyID int64, items []dispatchItem, results []push.Result) {
+	var dead []keys.TokenRef
+	for _, item := range items {
+		if results[item.resultIdx].Status == push.StatusUnregistered {
+			dead = append(dead, keys.TokenRef{Platform: string(item.platform), Token: item.msg.Token})
+		}
+	}
+	if err := s.keys.Unbind(context.WithoutCancel(ctx), keyID, dead); err != nil {
+		log.Printf("relay: unbind dead tokens: %v", err)
+	}
+}
+
 // chargeMessages spends n units of the key's per-message budget and of the relay-wide one,
 // answering 429 itself when either is empty. The relay-wide charge is returned if the key's
 // own budget refuses.
@@ -227,14 +244,14 @@ func (s *Server) chargeMessages(w http.ResponseWriter, keyID int64, n int) bool 
 	}
 	id := strconv.FormatInt(keyID, 10)
 	if s.msgLim != nil && !s.msgLim.AllowN(id, n) {
-		writeRateLimited(w, s.msgLim, "rate limit exceeded")
+		writeRateLimitedN(w, s.msgLim, id, n, "rate limit exceeded")
 		return false
 	}
 	if s.providerLim != nil && !s.providerLim.AllowN(providerBudgetKey, n) {
 		if s.msgLim != nil {
 			s.msgLim.ReturnN(id, n)
 		}
-		writeRateLimited(w, s.providerLim, "relay is busy, retry later")
+		writeRateLimitedN(w, s.providerLim, providerBudgetKey, n, "relay is busy, retry later")
 		return false
 	}
 	return true

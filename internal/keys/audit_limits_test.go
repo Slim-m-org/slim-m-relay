@@ -109,3 +109,28 @@ func TestBindCountsAreReadOncePerTransaction(t *testing.T) {
 		t.Fatalf("fourth insert = %v, want the in-memory count to hit the per-key cap", err)
 	}
 }
+
+func TestPurgeUnusedKeepsAKeyThatBoundATokenRecentlyEvenWithNoneLeft(t *testing.T) {
+	s := openTemp(t)
+	ctx := context.Background()
+	plain, _ := s.Issue(ctx, "desktop-first", 0)
+	k, _ := s.Verify(ctx, plain)
+	if _, err := s.BindTokens(ctx, k.ID, refs("ios", "t1"), BindLimits{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Unbind(ctx, k.ID, refs("ios", "t1")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE keys SET created_at = 1`); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := s.PurgeUnused(ctx, time.Hour); err != nil || n != 0 {
+		t.Fatalf("purged %d, %v; a key that bound a token within the window must survive", n, err)
+	}
+	if _, err := s.db.Exec(`UPDATE keys SET last_bound_at = 1`); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := s.PurgeUnused(ctx, time.Hour); err != nil || n != 1 {
+		t.Fatalf("purged %d, %v; a key idle past the window should go", n, err)
+	}
+}

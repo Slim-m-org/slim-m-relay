@@ -128,7 +128,19 @@ CREATE INDEX IF NOT EXISTS tokens_key_id ON tokens(key_id);`)
 	case !strings.Contains(alterErr.Error(), "duplicate column name"):
 		return alterErr
 	}
+	if err := s.addLastBoundAt(); err != nil {
+		return err
+	}
 	return s.widenTokenUniqueness()
+}
+
+// addLastBoundAt adds the stamp PurgeUnused reads; a duplicate-column error means it exists.
+func (s *Store) addLastBoundAt() error {
+	_, err := s.db.Exec(`ALTER TABLE keys ADD COLUMN last_bound_at INTEGER`)
+	if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		return err
+	}
+	return nil
 }
 
 // widenTokenUniqueness rebuilds a tokens table created with UNIQUE(platform, token), which
@@ -313,15 +325,17 @@ func (s *Store) Revoke(ctx context.Context, id int64) error {
 	return tx.Commit()
 }
 
-// PurgeUnused deletes keys that never bound a device token and were issued more than
-// olderThan ago, revoked or not, and returns how many it removed. A key that only ever
-// authenticated or sent empty batches counts as unused, so squatted keys cannot hold the
-// ceiling by touching last_used_at. Key ids are never reused, so a purged key cannot come
-// back as someone else's.
+// PurgeUnused deletes keys that hold no bound token, were issued more than olderThan ago and
+// have not bound one within that window, revoked or not, and returns how many it removed. A
+// key that only ever authenticated or sent empty batches counts as unused, so squatted keys
+// cannot hold the ceiling by touching last_used_at, while a key that really sent survives
+// having all its tokens pruned. Key ids are never reused, so a purged key cannot come back
+// as someone else's.
 func (s *Store) PurgeUnused(ctx context.Context, olderThan time.Duration) (int64, error) {
 	cutoff := time.Now().Add(-olderThan).Unix()
 	res, err := s.db.ExecContext(ctx,
-		`DELETE FROM keys WHERE created_at < ? AND NOT EXISTS (SELECT 1 FROM tokens WHERE tokens.key_id = keys.id)`, cutoff)
+		`DELETE FROM keys WHERE created_at < ? AND (last_bound_at IS NULL OR last_bound_at < ?)
+		 AND NOT EXISTS (SELECT 1 FROM tokens WHERE tokens.key_id = keys.id)`, cutoff, cutoff)
 	if err != nil {
 		return 0, err
 	}
@@ -369,6 +383,26 @@ func (s *Store) BindToken(ctx context.Context, keyID int64, platform, token stri
 	return errs[0]
 }
 
+// Unbind removes keyID's bindings for refs, for tokens the provider reported dead, so fake
+// tokens cannot pile up toward the relay-wide cap. Other keys' bindings are never touched.
+func (s *Store) Unbind(ctx context.Context, keyID int64, refs []TokenRef) error {
+	if len(refs) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, ref := range refs {
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM tokens WHERE platform = ? AND token = ? AND key_id = ?`, ref.Platform, ref.Token, keyID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // BindTokens enforces harassment-hardening for a whole batch in one transaction: a device
 // push token is bound, per platform, to the keys that have sent to it, and a key may
 // deliver to a token only through its own binding. Several keys may share a token, because
@@ -408,6 +442,14 @@ func (s *Store) BindTokens(ctx context.Context, keyID int64, refs []TokenRef, li
 	}
 
 	now := time.Now().Unix()
+	if len(refs) > 0 {
+		_, err = tx.ExecContext(ctx,
+			`UPDATE keys SET last_bound_at = ? WHERE id = ? AND (last_bound_at IS NULL OR last_bound_at < ?)`,
+			now, keyID, now-int64(stampInterval.Seconds()))
+		if err != nil {
+			return nil, err
+		}
+	}
 	outcomes := make([]error, len(refs))
 	counts := &bindCounts{}
 	for i, ref := range refs {

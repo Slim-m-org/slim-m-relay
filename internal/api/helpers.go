@@ -37,6 +37,19 @@ func writeRateLimited(w http.ResponseWriter, lim *ratelimit.Limiter, msg string)
 	writeErr(w, http.StatusTooManyRequests, msg)
 }
 
+// writeRateLimitedN is writeRateLimited for a refused charge of n units against key, so the
+// Retry-After covers the whole shortfall and not just the next unit.
+func writeRateLimitedN(w http.ResponseWriter, lim *ratelimit.Limiter, key string, n int, msg string) {
+	wait := lim.RetryAfterN(key, n)
+	if wait <= 0 {
+		wait = lim.RetryAfter()
+	}
+	if wait > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(int(wait/time.Second)))
+	}
+	writeErr(w, http.StatusTooManyRequests, msg)
+}
+
 // decodeJSON reads a JSON body up to maxBytes into v, rejecting unknown fields.
 func decodeJSON(w http.ResponseWriter, r *http.Request, v any, maxBytes int64) error {
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBytes))

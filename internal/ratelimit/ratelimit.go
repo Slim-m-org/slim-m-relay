@@ -74,6 +74,27 @@ func (l *Limiter) RetryAfter() time.Duration {
 	return time.Duration(math.Ceil(1/l.rate-1e-6)) * time.Second
 }
 
+// RetryAfterN is how long until key's bucket holds the n tokens an AllowN would spend, rounded
+// up to whole seconds. A key with no bucket, or one that already holds them, waits zero.
+func (l *Limiter) RetryAfterN(key string, n int) time.Duration {
+	if l.rate <= 0 {
+		return 0
+	}
+	cost := math.Max(1, math.Min(float64(n), l.burst))
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	el, ok := l.buckets[key]
+	if !ok {
+		return 0
+	}
+	b := el.Value.(*bucket)
+	have := math.Min(l.burst, b.tokens+time.Since(b.last).Seconds()*l.rate)
+	if have >= cost {
+		return 0
+	}
+	return time.Duration(math.Ceil((cost-have)/l.rate-1e-6)) * time.Second
+}
+
 // Allow reports whether an action for key may proceed, consuming one token if so.
 func (l *Limiter) Allow(key string) bool { return l.AllowN(key, 1) }
 

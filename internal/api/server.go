@@ -100,13 +100,19 @@ type healthCache struct {
 	until time.Time
 }
 
+// healthPingTimeout bounds one ping, which runs detached from the caller that triggered it.
+const healthPingTimeout = 3 * time.Second
+
 func (h *healthCache) check(ctx context.Context) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if now := time.Now(); now.Before(h.until) {
 		return h.err
 	}
-	h.err = h.ping(ctx)
+	// Detached, so one prober hanging up cannot cache a cancellation as the answer for everyone.
+	pingCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), healthPingTimeout)
+	defer cancel()
+	h.err = h.ping(pingCtx)
 	h.until = time.Now().Add(healthTTL)
 	return h.err
 }

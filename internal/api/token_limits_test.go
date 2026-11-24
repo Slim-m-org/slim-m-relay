@@ -133,3 +133,35 @@ func TestSendStopsBindingNewTokensAtThePerKeyCap(t *testing.T) {
 		t.Fatalf("an already bound token must keep working at the cap: %+v", res)
 	}
 }
+
+type deadSender struct{}
+
+func (deadSender) Send(_ context.Context, msgs []push.Message) []push.Result {
+	out := make([]push.Result, len(msgs))
+	for i, m := range msgs {
+		out[i] = push.Result{Token: m.Token, Status: push.StatusUnregistered}
+	}
+	return out
+}
+
+func TestSendDropsTheBindingOfATokenTheProviderReportsUnregistered(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "relay.db")
+	store, err := keys.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	plain, err := store.Issue(context.Background(), "a", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := New(defaultCfg(), &fakeSender{}, deadSender{}, store)
+	fake := "dVx3_k-Q9:APA91b" + strings.Repeat("Ab_-9", 40)
+	res := sendTokens(t, srv, plain, "android", fake)
+	if res[0].Status != push.StatusUnregistered {
+		t.Fatalf("status = %q, want unregistered", res[0].Status)
+	}
+	if n := countBoundTokens(t, path); n != 0 {
+		t.Fatalf("tokens rows = %d after an unregistered answer, want 0", n)
+	}
+}

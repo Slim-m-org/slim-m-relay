@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -99,5 +100,18 @@ func TestHealthzFloodQueriesTheDatabaseOnce(t *testing.T) {
 	}
 	if n := pings.Load(); n != 1 {
 		t.Fatalf("50 probes ran %d database pings, want 1", n)
+	}
+}
+
+func TestHealthzDoesNotCacheAProberHangingUp(t *testing.T) {
+	srv, _, _, _ := newTestServer(t, defaultCfg())
+	srv.health.ping = func(ctx context.Context) error { return ctx.Err() }
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	gone := httptest.NewRequest(http.MethodGet, "/healthz", nil).WithContext(ctx)
+	srv.Router().ServeHTTP(httptest.NewRecorder(), gone)
+
+	if rr := do(srv.Router(), http.MethodGet, "/healthz", "", ""); rr.Code != http.StatusOK {
+		t.Fatalf("healthz after another prober hung up = %d, want 200", rr.Code)
 	}
 }
