@@ -41,6 +41,9 @@ const (
 	KindVoice Kind = "voice"
 	// KindAdminAlert is a server health alert for the people who run the server.
 	KindAdminAlert Kind = "admin_alert"
+	// KindRead tells a device a channel was read on another of the account's devices, so it can
+	// take that channel's notifications down; on iOS it is a silent background push.
+	KindRead Kind = "read"
 )
 
 // CallSignalTTL bounds how long a provider may hold a call or call_end push for an

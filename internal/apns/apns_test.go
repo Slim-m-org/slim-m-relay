@@ -253,6 +253,25 @@ func TestSendCallEndKindIsSilentAndNotVoip(t *testing.T) {
 	}
 }
 
+// A read must never show anything: a low-priority background wake on the plain topic.
+func TestSendReadKindIsSilentBackgroundWake(t *testing.T) {
+	fc := &fakeClient{resp: &apns2.Response{StatusCode: 200}}
+	s := &Sender{client: fc, bundleID: "com.example.app"}
+	s.Send(context.Background(), []push.Message{{Token: "tok", Kind: push.KindRead, Payload: "cipher"}})
+
+	n := fc.got[0]
+	if n.Topic != "com.example.app" || n.PushType != apns2.PushTypeBackground || n.Priority != apns2.PriorityLow {
+		t.Fatalf("read push = topic %q type %q priority %d, want a low-priority background push on the bundle id", n.Topic, n.PushType, n.Priority)
+	}
+	raw, err := json.Marshal(n.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), `"alert"`) || strings.Contains(string(raw), `"badge"`) || strings.Contains(string(raw), `"sound"`) {
+		t.Errorf("read payload %s must carry no alert, badge or sound", raw)
+	}
+}
+
 // Only call signals expire with the ring; anything else keeps APNs' default store-and-forward.
 func TestSendExpiresOnlyCallSignals(t *testing.T) {
 	for _, kind := range []push.Kind{push.KindMessage, push.KindMention, push.KindCall, push.KindCallEnd, push.KindSecurity, push.KindWake, push.KindVoice, push.KindAdminAlert} {

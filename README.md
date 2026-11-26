@@ -14,7 +14,7 @@ So a host running the published apps gets working push on both platforms, and no
 The relay is deliberately minimal.
 It is not the messaging backend, and it is not part of slim-m's end-to-end encryption.
 The home server encrypts every payload before it ever reaches the relay.
-The relay forwards that opaque ciphertext, plus a coarse `kind` (`message`, `mention`, `call`, `call_end`, `security`, `voice`, `admin_alert`, or `wake`), to whichever provider the target device uses.
+The relay forwards that opaque ciphertext, plus a coarse `kind` (`message`, `mention`, `call`, `call_end`, `read`, `security`, `voice`, `admin_alert`, or `wake`), to whichever provider the target device uses.
 It never encrypts, decrypts, or inspects payload content, and it never logs it either.
 
 ## What the relay sees
@@ -80,12 +80,13 @@ Generate one with `openssl rand -hex 32`.
 Each client address may make a handful of failed admin attempts per minute before it gets `429`; a request with the right token is never throttled, even from an address that has used up its failed attempts.
 
 `platform` is `ios` or `android`.
-`kind` is `message`, `mention`, `call`, `call_end`, `security`, `voice`, `admin_alert`, or `wake`.
+`kind` is `message`, `mention`, `call`, `call_end`, `read`, `security`, `voice`, `admin_alert`, or `wake`.
 `payload` is the home server's already-encrypted blob, forwarded byte-for-byte; the relay never inspects it.
 `kind: "call"` is the one kind that changes how the push is delivered: on iOS it goes to the app's separate `<bundle id>.voip` PushKit topic at high priority instead of the plain background-wake topic, so the app needs the matching VoIP Services entitlement configured with Apple for it to ring.
 The `token` for a `call` on iOS must be the device's PushKit VoIP token, not its ordinary APNs token; APNs rejects an ordinary token on the `.voip` topic.
 `message`, `mention`, `security`, `voice` and `admin_alert` show a fixed, content-free alert on iOS ("New message", "You were mentioned", "New sign-in to your account", "Voice channel activity", "Server alert"), which the app's notification service extension may replace after decrypting the payload.
 `call_end` tells a device to stop a ring it may still be showing; on iOS it is a silent background push on the plain topic, never a VoIP push, since iOS terminates an app that takes a VoIP push without reporting a new call.
+`read` tells a device a channel was read elsewhere so it can clear that channel's notifications; on iOS it is a silent background push, and on Android a data message, with the channel only inside the sealed payload.
 `call` and `call_end` expire after 30 seconds (APNs `apns-expiration`, FCM `android.ttl`), matching the home server's ring timeout, so a device that reconnects late never rings for a call that is already over.
 Every Android push is a high-priority data-only message; the app builds any notification itself.
 

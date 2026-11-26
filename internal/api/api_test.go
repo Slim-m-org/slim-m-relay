@@ -367,6 +367,28 @@ func TestSendRejectsUnknownPlatformAndKind(t *testing.T) {
 	}
 }
 
+// A read reaches either platform under its own kind, so the device can clear a channel's notifications.
+func TestSendAcceptsReadKind(t *testing.T) {
+	srv, ios, android, store := newTestServer(t, defaultCfg())
+	key, _ := store.Issue(context.Background(), "", 0)
+
+	body := `{"messages":[
+		{"platform":"ios","token":"a","kind":"read","payload":"c"},
+		{"platform":"android","token":"b","kind":"read","payload":"c"}
+	]}`
+	rr := do(srv.Router(), http.MethodPost, "/v1/send", body, key)
+	var resp sendResp
+	_ = json.Unmarshal(rr.Body.Bytes(), &resp)
+	for _, r := range resp.Results {
+		if r.Status != push.StatusDelivered {
+			t.Errorf("result %+v, want delivered", r)
+		}
+	}
+	if len(ios.got) != 1 || ios.got[0].Kind != push.KindRead || len(android.got) != 1 || android.got[0].Kind != push.KindRead {
+		t.Errorf("ios got %+v, android got %+v, want the read kind forwarded to both", ios.got, android.got)
+	}
+}
+
 // A voice notice and an admin alert reach Android under their own kinds, so it can show its own line for each.
 func TestSendAcceptsVoiceAndAdminAlertKinds(t *testing.T) {
 	srv, _, android, store := newTestServer(t, defaultCfg())
